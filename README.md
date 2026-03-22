@@ -7,7 +7,7 @@ I use Unraid
 
 # radarr_cf_report.py:
 
-mkdir /mnt/user/appdat/scripts/reports
+mkdir /mnt/user/appdata/scripts/reports
 
 put the script and conf in: /mnt/user/appdata/scripts/
 
