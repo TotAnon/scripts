@@ -1,0 +1,90 @@
+# queue_manager.yml
+# Configuration for queue_manager.py
+
+# ── Storage location ────────────────────────────────────────────────────────
+# Where the watcher stores its state, lock, and log files.
+# Leave blank/omit to default to this script's own directory.
+state_dir: /mnt/user/appdata/scripts/natorr/queue_manager
+
+# ── qui ──────────────────────────────────────────────────────────────────────
+# Plain URL to qui's web UI/API. If you're using wrapper_arr_qui_watcher.sh,
+# this gets overwritten automatically before each run (resolved from your
+# "qui" container's current IP) - leave it as any placeholder. If running
+# this script directly instead, put a real reachable address here yourself.
+qui:
+  url: http://localhost:7476
+
+# ── Arr instances ────────────────────────────────────────────────────────────
+# One block per Radarr/Sonarr instance to watch.
+#
+#   type        must be exactly "radarr" or "sonarr"
+#   url         plain URL to this instance - same placeholder/override note
+#               as qui.url above
+#   qui_proxy   this instance's own qui proxy URL, copied straight from qui's
+#               UI - only the PATH portion (e.g. "/proxy/<hash>") is actually
+#               used, so it doesn't matter what host qui's UI shows there
+#               (and the wrapper's IP-patching leaves the path untouched)
+instances:
+  - name: Radarr
+    type: radarr
+    url: http://localhost:7878
+    api_key: Your_API_Key
+    qui_proxy: http://localhost:7476/proxy/Your_API_Key
+
+  - name: Sonarr
+    type: sonarr
+    url: http://localhost:8989
+    api_key: Your_API_Key
+    qui_proxy: http://localhost:7476/proxy/Your_API_Key
+
+  # To add another instance (e.g. a second Radarr for 4K content):
+  # - name: Radarr4K
+  #   type: radarr
+  #   url: http://192.168.1.50:7879
+  #   api_key: YOUR_KEY
+  #   qui_proxy: http://172.19.0.12:7476/proxy/.....
+
+# ── Behavior settings ────────────────────────────────────────────────────────
+settings:
+  pause_tag: paused-by-supersede
+
+  # Progress threshold (as a fraction, e.g. 0.10 = 10%) below which a
+  # superseded release is removed entirely instead of paused/tracked for
+  # possible resume. The torrent is paused BEFORE this is evaluated, so
+  # progress is frozen at decision time.
+  purge_progress_threshold: 0.08
+
+  # Set to false to disable deletion entirely - every loser gets paused and
+  # tracked for later resume instead, regardless of progress/MB threshold.
+  enable_purge: false
+
+  # If true, a paused loser won't resume even after its own race resolves
+  # until EVERY configured instance's queue is completely clear of anything
+  # else actively downloading. Can mean a paused loser waits a long time
+  # (or effectively never resumes) on a busy server.
+  wait_for_empty_queue_to_resume: false
+
+  # Trackers to leave completely untouched - matched as a case-insensitive
+  # substring against Arr's own "indexer" field.
+  excluded_trackers: []
+  # - IPTorrents
+
+  # Trackers that require finishing once a fixed AMOUNT has downloaded
+  # rather than a percentage of the file. Any tracker not listed here uses
+  # purge_progress_threshold as normal.
+  tracker_overrides: []
+  # - name: SomePrivateTracker
+  #   min_mb: 100
+
+  # How many *consecutive unreachable* attempts (retried every run) before
+  # sending a Discord error alert. Resets whenever qBit responds again.
+  resume_max_attempts_before_alert: 60
+
+# ── Discord ───────────────────────────────────────────────────────────────
+discord:
+  webhook_url: ""   # leave blank to disable
+
+# ── Log rotation ─────────────────────────────────────────────────────────
+logging:
+  max_bytes: 10485760   # 10 MB
+  backup_count: 5
