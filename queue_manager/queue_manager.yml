@@ -88,3 +88,17 @@ discord:
 logging:
   max_bytes: 10485760   # 10 MB
   backup_count: 5
+
+# ── Auto-update ──────────────────────────────────────────────────────────
+# On every run, checks queue_manager.py's VERSION on the branch below and,
+# if newer, downloads the new .py + .yml + CHANGELOG.md, verifies the new
+# .py compiles, merges your settings onto the new .yml template (see
+# CHANGELOG.md for exactly what happens to a setting that was removed or
+# changed shape), replaces both files, and posts a changelog to Discord.
+# Requires `pip install ruamel.yaml` - without it, this is skipped and
+# logged once per run.
+update:
+  check_for_updates: true
+  repo: TotAnon/scripts
+  branch: main
+  path_prefix: queue_manager
