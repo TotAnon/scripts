@@ -8,6 +8,24 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.3.0] - 2026-09-03
+
+### Removed
+- `update.delete_self_on_update` (added in 1.2.0), and the auto-delete
+  logic behind it. On real Unraid deployments (`/mnt/user`'s FUSE
+  union filesystem), `unlink()` on the running script could return
+  successfully without the file actually disappearing - 1.2.2 would have
+  patched that by verifying after the fact, but the whole approach is
+  more moving parts than warranted. Dropped in favor of the plan below.
+
+### Changed
+- The update notification now tells you to delete `queue_manager.py`
+  yourself to update - exactly TRaSH-Guides' own mover-tuning script's
+  wording for `mover.py` ("Delete mover.py and re-run script to update").
+  `queue_manager.sh` already re-fetches `queue_manager.py` from GitHub
+  whenever it's missing (kept from 1.2.0), so a manual delete is now all
+  updating ever takes - the script itself never deletes anything.
+
 ## [1.2.1] - 2026-09-03
 
 Test release - no functional change. Version bump only, to exercise the
