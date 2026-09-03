@@ -8,6 +8,12 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.2.1] - 2026-09-03
+
+Test release - no functional change. Version bump only, to exercise the
+update-check/notify/delete_self_on_update path end-to-end against a real
+deployment.
+
 ## [1.2.0] - 2026-09-03
 
 ### Added
