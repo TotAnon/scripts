@@ -10,7 +10,13 @@
 #
 # 2. Install dependencies (once, or after updating):
 #
-#       /mnt/user/appdata/scripts/natorr/python-venv/bin/pip install requests pyyaml
+#       /mnt/user/appdata/scripts/natorr/python-venv/bin/pip install requests pyyaml ruamel.yaml
+#
+#    ruamel.yaml is only needed for the auto-update feature (see
+#    settings.update below) - it's what lets the script rewrite
+#    queue_manager.yml in place without losing your comments. Without it
+#    installed, the script still runs fine; it just logs once per run that
+#    it's skipping the update check.
 #
 # 3. Verify:
 #
@@ -46,6 +52,7 @@ IP on a custom/macvlan network, reverse proxy, etc.) - this script
 doesn't care how you got there.
 
 Dependencies: pip install requests pyyaml
+Optional (auto-update only): pip install ruamel.yaml
 """
 
 import argparse
@@ -53,6 +60,8 @@ import datetime
 import fcntl
 import json
 import logging
+import os
+import py_compile
 import re
 import sys
 import time
@@ -63,6 +72,8 @@ from urllib.parse import urlparse
 
 import requests
 import yaml
+
+VERSION = "1.0.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -90,6 +101,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_bytes": 10 * 1024 * 1024,  # 10 MB
         "backup_count": 5,
     },
+    "update": {
+        "check_for_updates": True,
+        "repo": "TotAnon/scripts",
+        "branch": "main",
+        "path_prefix": "queue_manager",
+    },
 }
 
 
@@ -100,7 +117,7 @@ def load_config(path: Path) -> Dict[str, Any]:
         data = yaml.safe_load(f) or {}
 
     merged = dict(DEFAULT_CONFIG)
-    for key in ("qui", "settings", "discord", "logging"):
+    for key in ("qui", "settings", "discord", "logging", "update"):
         merged[key] = {**DEFAULT_CONFIG[key], **(data.get(key) or {})}
     merged["state_dir"] = data.get("state_dir", DEFAULT_CONFIG["state_dir"])
     merged["instances"] = data.get("instances", [])
@@ -952,6 +969,292 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Self-update
+#
+# Checked once at the start of every run (when settings.update.check_for_
+# updates is true). Compares this script's VERSION against the VERSION in
+# queue_manager.py on the configured GitHub branch; if newer, downloads the
+# new .py + .yml + CHANGELOG.md, verifies the new .py actually compiles,
+# merges the *values* from the current on-disk yml into the *new* yml
+# template (so any custom comments you've added to your own copy don't
+# survive - the template's shipped comments do, but every value you've set
+# is carried over onto it), atomically replaces both files, and sends a
+# Discord changelog notification. The run that performs an update exits
+# immediately afterward without touching any queue - the process already
+# has the old code loaded in memory, so it deliberately doesn't try to run
+# the rest of this run against a config file it just rewrote; the *next*
+# scheduled run starts clean with the new code and new config.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_version(v: str) -> Tuple[int, int, int]:
+    m = re.match(r'^\s*(\d+)\.(\d+)\.(\d+)', v or "")
+    if not m:
+        raise ValueError(f"Unparseable version string: {v!r}")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def value_kind(v: Any) -> str:
+    """Coarse type bucket used to decide whether a user's existing value
+    still 'fits' the new template's slot for the same key. bool is checked
+    before number since bool is technically an int subclass in Python."""
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, list):
+        return "list"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    return "other"
+
+
+def merge_and_diff(old_node: Any, tmpl_node: Any, path: str, changes: List[str]) -> None:
+    """Mutates `tmpl_node` (a ruamel CommentedMap, or a plain dict in tests)
+    in place: for every key the new template defines, carries the user's
+    existing value over from `old_node` if it's still the same kind of
+    value (a whole list/dict is treated as one opaque leaf, so arbitrary
+    user data like `instances` or `tracker_overrides` moves over verbatim
+    rather than being diffed item-by-item). Appends a human-readable note
+    to `changes` for anything that doesn't carry over cleanly:
+      - a key the user had set that no longer exists in the new template
+        at all (removed)
+      - a key that exists in both but changed shape/type (e.g. was a
+        single value and is now a section, or was a number and is now a
+        list) - the template's own (conservative, shipped) default is left
+        in place for these
+    A key that's new in the template (not in old_node) is *not* reported -
+    picking up a new default isn't a change to anything the user set."""
+    if not isinstance(tmpl_node, dict):
+        return
+
+    old_is_dict = isinstance(old_node, dict)
+    keys = list(tmpl_node.keys())
+    if old_is_dict:
+        keys += [k for k in old_node.keys() if k not in tmpl_node]
+
+    for key in keys:
+        sub_path = f"{path}.{key}" if path else key
+        has_old = old_is_dict and key in old_node
+        old_val = old_node.get(key) if has_old else None
+
+        if key not in tmpl_node:
+            changes.append(f"`{sub_path}` was removed in this version (was `{old_val!r}`)")
+            continue
+
+        tmpl_val = tmpl_node[key]
+
+        if isinstance(tmpl_val, dict):
+            if has_old and not isinstance(old_val, dict):
+                changes.append(f"`{sub_path}` changed shape - reset to the new defaults")
+                continue
+            merge_and_diff(old_val if has_old else None, tmpl_val, sub_path, changes)
+            continue
+
+        if not has_old:
+            continue
+        if tmpl_val is None or old_val is None:
+            # None on either side means "no enforced type here" - always
+            # keep whatever the user had rather than treating it as a
+            # mismatch.
+            tmpl_node[key] = old_val
+            continue
+        if value_kind(old_val) == value_kind(tmpl_val):
+            tmpl_node[key] = old_val
+        else:
+            changes.append(f"`{sub_path}` changed type (was `{old_val!r}`) - reset to the new default `{tmpl_val!r}`")
+
+
+def _load_ruamel():
+    """Returns a configured ruamel.yaml.YAML round-trip instance, or None if
+    ruamel.yaml isn't installed. Imported lazily so the rest of the script
+    (and everything except the update check) keeps working with just
+    requests + pyyaml."""
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        return None
+    y = YAML()
+    y.preserve_quotes = True
+    y.indent(mapping=2, sequence=4, offset=2)
+    return y
+
+
+def fetch_raw(repo: str, branch: str, path_prefix: str, filename: str) -> Optional[str]:
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path_prefix}/{filename}"
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code != 200:
+            log(f"[Update] Fetching {filename} returned status {res.status_code}.")
+            return None
+        return res.text
+    except Exception as e:
+        log(f"[Update] Failed to fetch {filename}: {e}")
+        return None
+
+
+def extract_version(py_text: str) -> Optional[str]:
+    m = re.search(r'^VERSION\s*=\s*["\']([\d.]+)["\']', py_text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def extract_changelog_since(changelog_text: str, since_version: str) -> str:
+    """Every '## [X.Y.Z] ...' section strictly newer than since_version,
+    newest first - so a run that skipped several versions still reports the
+    full cumulative changelog, not just the latest entry."""
+    try:
+        since = parse_version(since_version)
+    except ValueError:
+        since = (0, 0, 0)
+
+    sections = re.split(r'(?m)^##\s*\[(\d+\.\d+\.\d+)\][^\n]*\n', changelog_text)
+    parts = []
+    for i in range(1, len(sections), 2):
+        ver, body = sections[i], sections[i + 1]
+        try:
+            if parse_version(ver) > since:
+                parts.append(f"**[{ver}]**\n{body.strip()}")
+        except ValueError:
+            continue
+    return "\n\n".join(parts).strip()
+
+
+def apply_update(new_py_text: str, merged_template: Any, yaml_rt: Any, py_path: Path, yml_path: Path) -> bool:
+    """Validates the downloaded .py actually compiles, then atomically
+    replaces both the live script and its yml config. Nothing is written
+    unless the compile check passes, so a bad fetch never leaves the script
+    unable to start on the next run - and the two files are only ever
+    swapped in together, since a given version's .py and .yml ship as a
+    matched pair."""
+    tmp_py = py_path.parent / f"{py_path.name}.new"
+    tmp_yml = yml_path.parent / f"{yml_path.name}.new"
+    tmp_pyc = py_path.parent / f"{py_path.name}.new.compile-check"
+
+    try:
+        tmp_py.write_text(new_py_text)
+        py_compile.compile(str(tmp_py), cfile=str(tmp_pyc), doraise=True)
+    except Exception as e:
+        log(f"[Update] Downloaded queue_manager.py failed to compile; aborting update: {e}")
+        tmp_py.unlink(missing_ok=True)
+        return False
+    finally:
+        tmp_pyc.unlink(missing_ok=True)
+
+    try:
+        with open(tmp_yml, "w") as f:
+            yaml_rt.dump(merged_template, f)
+    except Exception as e:
+        log(f"[Update] Failed to write merged yml: {e}")
+        tmp_py.unlink(missing_ok=True)
+        tmp_yml.unlink(missing_ok=True)
+        return False
+
+    os.replace(tmp_py, py_path)
+    os.replace(tmp_yml, yml_path)
+    return True
+
+
+def send_update_notification(old_version: str, new_version: str, changelog: str, setting_changes: List[str]) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    description_parts = []
+    if changelog:
+        cl = changelog if len(changelog) <= 3500 else changelog[:3490] + "\n… (truncated)"
+        description_parts.append(cl)
+    if setting_changes:
+        notes = "\n".join(f"- {c}" for c in setting_changes)
+        if len(notes) > 900:
+            notes = notes[:880] + "\n… (truncated)"
+        description_parts.append(f"**Config settings reset to new defaults:**\n{notes}")
+    description = "\n\n".join(description_parts) or "No changelog available."
+
+    embed = {
+        "title": f"🔄 Updated queue_manager {old_version} → {new_version}",
+        "description": description,
+        "color": 0x3498DB,  # blue
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    }
+    try:
+        res = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        if res.status_code >= 300:
+            log(f"[Discord] Update notification webhook returned status {res.status_code}: {res.text[:200]}")
+    except Exception as e:
+        log(f"[Discord] Failed to send update notification: {e}")
+
+
+def check_for_updates(update_cfg: Dict[str, Any], config_path: Path) -> bool:
+    """Returns True if an update was applied (caller should stop the run
+    right there and let the next scheduled invocation pick up the new
+    code/config)."""
+    if not update_cfg.get("check_for_updates", True):
+        return False
+
+    repo = (update_cfg.get("repo") or "").strip()
+    branch = (update_cfg.get("branch") or "main").strip()
+    path_prefix = (update_cfg.get("path_prefix") or "queue_manager").strip()
+    if not repo:
+        log("[Update] No update.repo configured; skipping update check.")
+        return False
+
+    yaml_rt = _load_ruamel()
+    if yaml_rt is None:
+        log("[Update] ruamel.yaml is not installed; skipping update check (pip install ruamel.yaml to enable auto-update).")
+        return False
+
+    remote_py = fetch_raw(repo, branch, path_prefix, "queue_manager.py")
+    if remote_py is None:
+        return False
+
+    remote_version = extract_version(remote_py)
+    if not remote_version:
+        log("[Update] Could not find a VERSION string in the remote queue_manager.py; skipping.")
+        return False
+
+    try:
+        if parse_version(remote_version) <= parse_version(VERSION):
+            return False
+    except ValueError as e:
+        log(f"[Update] {e}; skipping.")
+        return False
+
+    log(f"[Update] New version available: {VERSION} -> {remote_version}. Fetching config template and changelog...")
+
+    remote_yml = fetch_raw(repo, branch, path_prefix, "queue_manager.yml")
+    if remote_yml is None:
+        log("[Update] Could not fetch the new queue_manager.yml; aborting update (.py and .yml only ever ship together).")
+        return False
+
+    remote_changelog = fetch_raw(repo, branch, path_prefix, "CHANGELOG.md") or ""
+
+    try:
+        template = yaml_rt.load(remote_yml)
+    except Exception as e:
+        log(f"[Update] Downloaded queue_manager.yml failed to parse; aborting update: {e}")
+        return False
+
+    try:
+        with open(config_path) as f:
+            old_raw = yaml.safe_load(f) or {}
+    except Exception as e:
+        log(f"[Update] Could not re-read current config for merging; aborting update: {e}")
+        return False
+
+    setting_changes: List[str] = []
+    merge_and_diff(old_raw, template, "", setting_changes)
+
+    ok = apply_update(remote_py, template, yaml_rt, Path(__file__).resolve(), config_path)
+    if not ok:
+        record_event("error", text=f"Update to v{remote_version} failed - see log for details")
+        send_discord_batch(DISCORD_EVENTS)
+        return False
+
+    log(f"[Update] Updated {VERSION} -> {remote_version}. The next scheduled run will use the new version.")
+    changelog_excerpt = extract_changelog_since(remote_changelog, VERSION) if remote_changelog else ""
+    send_update_notification(VERSION, remote_version, changelog_excerpt, setting_changes)
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1007,7 +1310,11 @@ def main() -> None:
         sys.exit(0)
 
     DISCORD_EVENTS.clear()
-    log("=== Running Arr Queue Watcher ===")
+    log(f"=== Running Arr Queue Watcher (v{VERSION}) ===")
+
+    if check_for_updates(config.get("update") or {}, args.config):
+        log("=== Run stopped after applying an update; next scheduled run will use the new version ===")
+        sys.exit(0)
 
     qui_url = (config.get("qui") or {}).get("url", "").strip()
     if not qui_url:
