@@ -8,6 +8,16 @@ see the `update.*` config keys in `queue_manager.yml` for the source repo/
 branch, and the "Self-update" section in `queue_manager.py` for exactly what
 that does to your files.
 
+## [1.0.2] - 2026-09-03
+
+### Fixed
+- `main()` was casting `settings.*` values (`int()`/`float()`/`bool()`)
+  *before* `check_for_updates()` ran. A value that no longer parsed under
+  an old config (exactly the case the update mechanism exists to heal)
+  crashed the run before self-update ever got a chance to fix it. The
+  update check now runs first; the strict settings casts only happen once
+  no update was applied.
+
 ## [1.0.1] - 2026-09-03
 
 ### Added
