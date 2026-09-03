@@ -73,7 +73,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -1281,6 +1281,38 @@ def main() -> None:
     STATE_FILE = SCRIPT_DIR / "paused_superseded.json"
     LOCK_FILE = SCRIPT_DIR / "watcher.lock"
 
+    # DISCORD_WEBHOOK_URL is needed by check_for_updates() (for the update
+    # notification) and is just a string, so it's safe to pull out this
+    # early - unlike the settings.* casts below, which assume a config
+    # that's already valid for *this* version and are deliberately done
+    # only after the update check has had a chance to run.
+    DISCORD_WEBHOOK_URL = (config.get("discord") or {}).get("webhook_url", "").strip()
+
+    setup_logging(LOG_FILE, int(config["logging"].get("max_bytes", 10 * 1024 * 1024)),
+                  int(config["logging"].get("backup_count", 5)))
+
+    # Single-instance lock: prevents two overlapping cron/user-script runs
+    # from touching paused_superseded.json (or the update files) at the
+    # same time.
+    lock_fp = open(LOCK_FILE, "a+")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("Another instance of the watcher is already running - skipping this run.")
+        sys.exit(0)
+
+    DISCORD_EVENTS.clear()
+    log(f"=== Running Arr Queue Watcher (v{VERSION}) ===")
+
+    # Deliberately runs before any strict parsing (int()/float()/bool()) of
+    # settings below - the whole point of the update mechanism is to heal a
+    # config that no longer matches what this version expects, so a value
+    # that fails to parse under the *old* schema must not crash the run
+    # before it's had a chance to update and reset that value.
+    if check_for_updates(config.get("update") or {}, args.config):
+        log("=== Run stopped after applying an update; next scheduled run will use the new version ===")
+        sys.exit(0)
+
     # load_config() already merged DEFAULT_CONFIG into these dicts, so every
     # key below is guaranteed present - no fallback defaults needed here.
     settings = config["settings"]
@@ -1295,26 +1327,6 @@ def main() -> None:
         if t.get("name", "").strip()
     ]
     RESUME_MAX_ATTEMPTS_BEFORE_ALERT = int(settings["resume_max_attempts_before_alert"])
-    DISCORD_WEBHOOK_URL = config["discord"]["webhook_url"].strip()
-
-    setup_logging(LOG_FILE, int(config["logging"].get("max_bytes", 10 * 1024 * 1024)),
-                  int(config["logging"].get("backup_count", 5)))
-
-    # Single-instance lock: prevents two overlapping cron/user-script runs
-    # from touching paused_superseded.json at the same time.
-    lock_fp = open(LOCK_FILE, "a+")
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        log("Another instance of the watcher is already running - skipping this run.")
-        sys.exit(0)
-
-    DISCORD_EVENTS.clear()
-    log(f"=== Running Arr Queue Watcher (v{VERSION}) ===")
-
-    if check_for_updates(config.get("update") or {}, args.config):
-        log("=== Run stopped after applying an update; next scheduled run will use the new version ===")
-        sys.exit(0)
 
     qui_url = (config.get("qui") or {}).get("url", "").strip()
     if not qui_url:
