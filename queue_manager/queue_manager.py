@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -293,7 +293,7 @@ def build_grouped_embed(kind_events: List[Dict[str, Any]], title: str, color: in
         "title": title,
         "color": color,
         "fields": fields,
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
 
@@ -332,7 +332,7 @@ def send_discord_batch(events: List[Dict[str, Any]]) -> None:
                 "title": titles[kind],
                 "description": description,
                 "color": colors[kind],
-                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
 
     if not embeds:
@@ -641,6 +641,12 @@ def calculate_rank(item: Dict[str, Any], progress: float = 0.0) -> Tuple[int, in
     return (score, quality_weight, progress)
 
 
+def normalize_progress(raw_progress: float) -> float:
+    """qBit normally reports progress as 0.0-1.0, but tolerate 0-100 too."""
+    prog = float(raw_progress)
+    return prog if prog <= 1.0 else prog / 100.0
+
+
 def attempt_pause_and_read_progress(proxy_client: QBitProxyClient, torrent_hash: str):
     """Confirms the torrent is actually paused, then reads live progress and
     total bytes downloaded. Returns (progress, name, downloaded_bytes) on
@@ -654,9 +660,53 @@ def attempt_pause_and_read_progress(proxy_client: QBitProxyClient, torrent_hash:
     if not live_data or "progress" not in live_data:
         return None
 
-    prog = float(live_data["progress"])
-    progress = prog if prog <= 1.0 else prog / 100.0
+    progress = normalize_progress(live_data["progress"])
     return progress, live_data.get("name"), live_data.get("downloaded")
+
+
+def decide_purge(tracker_min_mb: Optional[float], downloaded_bytes: Optional[float], progress: float) -> Tuple[bool, bool, str]:
+    """Shared by both the initial detection pass and the pending_check
+    follow-up, which used to each carry their own copy of this - one
+    tracker-minimum-MB check and one percentage-threshold check, previously
+    duplicated verbatim (and already slightly drifted in wording) in two
+    places. Returns (would_purge, should_purge, amount_label):
+      - would_purge: true if progress is below whichever threshold applies
+      - should_purge: would_purge AND ENABLE_PURGE - what the caller should
+        actually act on
+      - amount_label: the human-readable "12.3MB (tracker minimum 100MB)"
+        or "8.4%" string used in both logs and Discord notifications"""
+    if tracker_min_mb is not None:
+        downloaded_mb = (downloaded_bytes or 0) / (1024 * 1024)
+        would_purge = downloaded_mb < tracker_min_mb
+        amount_label = f"{downloaded_mb:.1f}MB (tracker minimum {tracker_min_mb:.0f}MB)"
+    else:
+        would_purge = progress < PURGE_PROGRESS_THRESHOLD
+        amount_label = f"{progress*100:.1f}%"
+    should_purge = would_purge and ENABLE_PURGE
+    return would_purge, should_purge, amount_label
+
+
+def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase: str,
+                        winner_name: str, winner_score: Any, loser_score: Any,
+                        winner_indexer: str, loser_indexer: str, tracker_min_mb: Optional[float]) -> Dict[str, Any]:
+    """The tracked_state record shape - was built as an identical inline
+    dict literal at both the point a loser is first paused and the point a
+    pending_check resolves into one."""
+    return {
+        "hash": h,
+        "name": name,
+        "target_id": target_id,
+        "service": app_label,
+        "phase": phase,
+        "resume_attempts": 0,
+        "consecutive_unreachable": 0,
+        "winner_name": winner_name,
+        "winner_score": winner_score,
+        "loser_score": loser_score,
+        "winner_indexer": winner_indexer,
+        "loser_indexer": loser_indexer,
+        "tracker_min_mb": tracker_min_mb,
+    }
 
 
 def process_service(app_label: str, base_url: str, api_key: str, proxy_client: QBitProxyClient,
@@ -699,23 +749,32 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
         if len(fresh_items) <= 1:
             continue
 
-        # Only needed to break ties (see calculate_rank's docstring), but
-        # cheap enough (read-only qBit lookup, no pause) to fetch for every
-        # candidate up front rather than special-casing the tied ones.
-        item_progress: Dict[str, float] = {}
-        for i in fresh_items:
-            dl_id = (i.get("downloadId") or "").lower()
-            if not dl_id:
-                continue
-            live = proxy_client.get_live_torrent(dl_id)
-            if live and "progress" in live:
-                p = float(live["progress"])
-                item_progress[dl_id] = p if p <= 1.0 else p / 100.0
+        # Rank on (customFormatScore, quality) alone first - the common
+        # case is a real upgrade, which this alone already decides, with no
+        # qBit round trips needed. Only when multiple candidates are
+        # genuinely tied at the top does live progress matter (see
+        # calculate_rank's docstring) - so only pay for those lookups, and
+        # only for the items actually tied for first place, not every
+        # candidate in the group.
+        fresh_items.sort(key=calculate_rank, reverse=True)
+        top_key = calculate_rank(fresh_items[0])[:2]
+        tied_at_top = [i for i in fresh_items if calculate_rank(i)[:2] == top_key]
 
-        fresh_items.sort(
-            key=lambda i: calculate_rank(i, item_progress.get((i.get("downloadId") or "").lower(), 0.0)),
-            reverse=True,
-        )
+        if len(tied_at_top) > 1:
+            item_progress: Dict[str, float] = {}
+            for i in tied_at_top:
+                dl_id = (i.get("downloadId") or "").lower()
+                if not dl_id:
+                    continue
+                live = proxy_client.get_live_torrent(dl_id)
+                if live and "progress" in live:
+                    item_progress[dl_id] = normalize_progress(live["progress"])
+
+            fresh_items.sort(
+                key=lambda i: calculate_rank(i, item_progress.get((i.get("downloadId") or "").lower(), 0.0)),
+                reverse=True,
+            )
+
         winner_item = fresh_items[0]
         winner_name = winner_item.get("title") or winner_item.get("downloadId", "unknown release")
         winner_score = winner_item.get("customFormatScore", 0)
@@ -743,34 +802,16 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             if result is None:
                 name = loser.get("title", loser_hash)
                 log(f"[{app_label}] Could not confirm pause + live progress for '{name}'; leaving pending and deferring the purge/track decision.")
-                tracked_state[f"{app_label}:{h}"] = {
-                    "hash": h,
-                    "name": name,
-                    "target_id": target_id,
-                    "service": app_label,
-                    "phase": "pending_check",
-                    "resume_attempts": 0,
-                    "consecutive_unreachable": 0,
-                    "winner_name": winner_name,
-                    "winner_score": winner_score,
-                    "loser_score": loser_score,
-                    "winner_indexer": winner_indexer,
-                    "loser_indexer": loser_indexer,
-                    "tracker_min_mb": tracker_min_mb
-                }
+                tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
+                    h, name, target_id, app_label, "pending_check",
+                    winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
+                )
                 continue
 
             progress, live_name, downloaded_bytes = result
             name = live_name or loser.get("title", loser_hash)
 
-            if tracker_min_mb is not None:
-                downloaded_mb = (downloaded_bytes or 0) / (1024 * 1024)
-                would_purge = downloaded_mb < tracker_min_mb
-                amount_label = f"{downloaded_mb:.1f}MB (tracker minimum {tracker_min_mb:.0f}MB)"
-            else:
-                would_purge = progress < PURGE_PROGRESS_THRESHOLD
-                amount_label = f"{progress*100:.1f}%"
-            should_purge = would_purge and ENABLE_PURGE
+            would_purge, should_purge, amount_label = decide_purge(tracker_min_mb, downloaded_bytes, progress)
             disabled_note = "deletion disabled" if (would_purge and not ENABLE_PURGE) else None
 
             if should_purge:
@@ -786,26 +827,20 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             else:
                 log(f"[{app_label}] [Live qBit, post-pause] {amount_label}. Tagging + deprioritizing '{name}' (already paused){' - would have purged, but ENABLE_PURGE is disabled' if disabled_note else ''}")
                 proxy_client.tag_and_deprioritize(h)
-                tracked_state[f"{app_label}:{h}"] = {
-                    "hash": h,
-                    "name": name,
-                    "target_id": target_id,
-                    "service": app_label,
-                    "phase": "paused",
-                    "resume_attempts": 0,
-                    "consecutive_unreachable": 0,
-                    "winner_name": winner_name,
-                    "winner_score": winner_score,
-                    "loser_score": loser_score,
-                    "winner_indexer": winner_indexer,
-                    "loser_indexer": loser_indexer,
-                    "tracker_min_mb": tracker_min_mb
-                }
+                tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
+                    h, name, target_id, app_label, "paused",
+                    winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
+                )
                 record_event("pause", app_name=app_type, app_label=app_label, name=name, score=loser_score,
                              amount_display=amount_label, winner_name=winner_name, winner_score=winner_score,
                              winner_indexer=winner_indexer, loser_indexer=loser_indexer, note=disabled_note)
 
     # ----- Resume-management pass -----
+    # Recomputed rather than reusing already_tracked_hashes above (even
+    # though the expression is identical) - the detection pass just above
+    # may have added new entries to tracked_state, and those need to count
+    # here too so a hash we just started tracking this very run isn't
+    # mistaken for "still actively competing" below.
     tracked_hashes_this_app = {meta.get("hash", k) for k, meta in tracked_state.items() if meta.get("service") == app_label}
     to_drop = []
 
@@ -824,8 +859,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 to_drop.append(thash)
                 continue
 
-            prog = float(live_data.get("progress", 0.0))
-            progress = prog if prog <= 1.0 else prog / 100.0
+            progress = normalize_progress(live_data.get("progress", 0.0))
 
             if progress >= 0.999:
                 log(f"[{app_label}] '{meta.get('name')}' finished downloading; no longer tracking.")
@@ -851,14 +885,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             loser_indexer = meta.get("loser_indexer", "")
             tracker_min_mb = meta.get("tracker_min_mb")
 
-            if tracker_min_mb is not None:
-                downloaded_mb = (downloaded_bytes or 0) / (1024 * 1024)
-                would_purge = downloaded_mb < tracker_min_mb
-                amount_label = f"{downloaded_mb:.1f}MB (tracker minimum {tracker_min_mb:.0f}MB)"
-            else:
-                would_purge = progress < PURGE_PROGRESS_THRESHOLD
-                amount_label = f"{progress*100:.1f}%"
-            should_purge = would_purge and ENABLE_PURGE
+            would_purge, should_purge, amount_label = decide_purge(tracker_min_mb, downloaded_bytes, progress)
             note = "deletion disabled, confirmed on a follow-up check" if (would_purge and not ENABLE_PURGE) else "confirmed on a follow-up check"
 
             if should_purge:
@@ -1030,7 +1057,7 @@ def send_update_available_notification(current_version: str, new_version: str, c
         "title": f"🔔 queue_manager update available: {current_version} → {new_version}",
         "description": f"{description}\n\nUpdate by hand - see the repo for the new `queue_manager.py`/`.yml`.",
         "color": 0x3498DB,  # blue
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     try:
         res = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)

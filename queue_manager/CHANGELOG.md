@@ -9,6 +9,32 @@ config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check (notify-only)" section in `queue_manager.py`. It never
 downloads or changes any file - you still update by hand.
 
+## [1.1.1] - 2026-09-03
+
+### Changed
+- Skip qBit progress lookups entirely for a superseded group unless
+  candidates are actually tied on `customFormatScore` + quality - the
+  common case (a real upgrade) is now decided from Arr's own queue data
+  alone, with zero extra qBit API calls. When there is a genuine tie, only
+  the tied candidates get a live-progress lookup, not every item in the
+  group.
+- `datetime.utcnow()` (deprecated since Python 3.12) replaced with
+  `datetime.now(timezone.utc)` throughout.
+
+### Fixed / Refactored
+- The purge-vs-track decision (percentage or tracker-minimum-MB threshold)
+  was duplicated verbatim in two places and had already drifted slightly
+  in wording between them - extracted into a single `decide_purge()`.
+- The `tracked_state` entry dict was built as an identical 12-field inline
+  literal in two places - extracted into `make_tracked_entry()`.
+- The `progress if progress <= 1.0 else progress / 100.0` normalization
+  was repeated three times - extracted into `normalize_progress()`.
+- No behavior change from any of the above - verified against the
+  original inline logic. Added a comment where two textually-identical
+  set comprehensions in `process_service` were confirmed to be
+  intentionally *not* mergeable (the second one must be recomputed
+  because `tracked_state` gains entries between the two points).
+
 ## [1.1.0] - 2026-09-03
 
 ### Changed
