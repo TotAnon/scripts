@@ -89,15 +89,26 @@ logging:
   max_bytes: 10485760   # 10 MB
   backup_count: 5
 
-# ── Update check (notify-only) ───────────────────────────────────────────
+# ── Update check ─────────────────────────────────────────────────────────
 # On every run, checks queue_manager.py's VERSION on the branch below and,
 # if newer, posts a Discord notification with the changelog since your
 # current version (only once per new version - it won't re-notify every
-# run while you're getting around to updating). Nothing is downloaded or
-# changed on disk - you still update by hand. No extra dependency beyond
+# run while you're getting around to updating). No extra dependency beyond
 # requests + pyyaml.
 update:
   check_for_updates: true
   repo: TotAnon/scripts
   branch: main
   path_prefix: queue_manager
+
+  # Opt-in, default false. When true, once a newer version is detected,
+  # this deletes queue_manager.py itself (never this .yml) so the next run
+  # re-fetches it fresh - same pattern as TRaSH-Guides' mover-tuning script
+  # re-fetching mover.py. REQUIRES your launcher to check for the file
+  # being missing and re-download it before invoking Python again -
+  # queue_manager.sh (as shipped) does this. If you invoke queue_manager.py
+  # directly (a different wrapper, a raw cron line) without that check,
+  # turning this on will break future runs the moment it deletes itself,
+  # until you notice and manually restore the file. Leave this false unless
+  # you're using queue_manager.sh and have read CHANGELOG.md's note on it.
+  delete_self_on_update: false

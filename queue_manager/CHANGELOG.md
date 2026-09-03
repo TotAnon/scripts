@@ -6,8 +6,28 @@ is enabled), the script compares its own `VERSION` against this file's
 latest entry on the configured GitHub branch and, if newer, posts a Discord
 notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
-"Update check (notify-only)" section in `queue_manager.py`. It never
-downloads or changes any file - you still update by hand.
+"Update check" section in `queue_manager.py`.
+
+## [1.2.0] - 2026-09-03
+
+### Added
+- Opt-in `update.delete_self_on_update` (default `false`). When enabled,
+  once a newer version is detected, `queue_manager.py` deletes itself
+  (never `queue_manager.yml`) - the same pattern TRaSH-Guides' own
+  mover-tuning script uses for `mover.py`. **Requires a launcher that
+  checks for the file being missing and re-downloads it before invoking
+  Python again** - `queue_manager.sh` (as shipped) now does this. If you
+  invoke `queue_manager.py` directly (a different wrapper, a raw cron
+  line) without that check, enabling this will break future runs the
+  moment it deletes itself, until the file is manually restored. That's
+  why it defaults off - only turn it on if you're using `queue_manager.sh`
+  (or an equivalent launcher) as your actual entry point.
+- `queue_manager.sh`: fetches `queue_manager.py` fresh from GitHub if it's
+  missing, before running it. A no-op when `delete_self_on_update` is left
+  at its default.
+- Delete attempts retry on every run (independent of the Discord notify
+  dedup) so a transient failure (e.g. a permissions hiccup) self-heals on
+  the next run instead of leaving the old version running indefinitely.
 
 ## [1.1.1] - 2026-09-03
 

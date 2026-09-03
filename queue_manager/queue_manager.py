@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -97,6 +97,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "repo": "TotAnon/scripts",
         "branch": "main",
         "path_prefix": "queue_manager",
+        # Opt-in and off by default - see check_for_updates()'s docstring
+        # for exactly what this does and what it depends on.
+        "delete_self_on_update": False,
     },
 }
 
@@ -987,16 +990,21 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Update check (notify-only)
+# Update check
 #
 # Checked once at the start of every run (when settings.update.check_for_
 # updates is true). Compares this script's VERSION against the VERSION in
 # queue_manager.py on the configured GitHub branch, and if newer, sends a
 # Discord notification with the changelog since the current version.
-# Nothing is downloaded and applied and no file on disk is touched - same
-# posture as TRaSH-Guides' own mover-tuning script: check, notify, and let
-# you update by hand. Needs only requests + pyyaml (already required for
-# everything else), no extra dependency.
+#
+# By default that's the whole story - notify-only, same posture as
+# TRaSH-Guides' own mover-tuning script: check, notify, let you update by
+# hand. Needs only requests + pyyaml, no extra dependency.
+#
+# If settings.update.delete_self_on_update is true, it goes one step
+# further and deletes queue_manager.py itself so your launcher re-fetches
+# it fresh next run - see delete_self_for_update()'s docstring for what
+# that requires.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_version(v: str) -> Tuple[int, int, int]:
@@ -1045,7 +1053,7 @@ def extract_changelog_since(changelog_text: str, since_version: str) -> str:
     return "\n\n".join(parts).strip()
 
 
-def send_update_available_notification(current_version: str, new_version: str, changelog: str) -> None:
+def send_update_available_notification(current_version: str, new_version: str, changelog: str, delete_self: bool) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
 
@@ -1053,9 +1061,17 @@ def send_update_available_notification(current_version: str, new_version: str, c
     if len(description) > 3900:
         description = description[:3890] + "\n… (truncated)"
 
+    if delete_self:
+        action_note = (
+            f"\n\n🗑️ `delete_self_on_update` is enabled - this copy of queue_manager.py is deleting "
+            f"itself now. The next scheduled run will fetch v{new_version} fresh via your launcher script."
+        )
+    else:
+        action_note = "\n\nUpdate by hand - see the repo for the new `queue_manager.py`/`.yml`."
+
     embed = {
         "title": f"🔔 queue_manager update available: {current_version} → {new_version}",
-        "description": f"{description}\n\nUpdate by hand - see the repo for the new `queue_manager.py`/`.yml`.",
+        "description": f"{description}{action_note}",
         "color": 0x3498DB,  # blue
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -1067,12 +1083,41 @@ def send_update_available_notification(current_version: str, new_version: str, c
         log(f"[Discord] Failed to send update notification: {e}")
 
 
+def delete_self_for_update(new_version: str) -> None:
+    """Deletes this running script's own .py file from disk, so that
+    whatever invokes it next (queue_manager.sh, or an equivalent launcher)
+    re-fetches the new version fresh - the same pattern TRaSH-Guides' own
+    mover-tuning script uses for mover.py. Safe to do mid-run: Python has
+    already loaded this process's code into memory, so removing the file
+    from disk has no effect on the currently running process - it only
+    matters for whatever *starts the next run*.
+
+    Only the .py deletes itself - queue_manager.yml (all your actual
+    settings) is never touched. This requires your launcher to check for
+    the file being missing and re-download it before invoking Python again;
+    queue_manager.sh does this. If you invoke queue_manager.py directly
+    (cron, a different wrapper) without that check, deleting it here will
+    break future runs until it's manually restored - which is exactly why
+    this is opt-in and defaults off."""
+    py_path = Path(__file__).resolve()
+    try:
+        py_path.unlink()
+        log(f"[Update] Deleted {py_path.name} so the next run fetches v{new_version} fresh "
+            f"(requires a launcher that re-downloads it when missing, e.g. queue_manager.sh).")
+    except Exception as e:
+        log(f"[Update] delete_self_on_update is enabled but deleting {py_path} failed: {e}")
+
+
 def check_for_updates(update_cfg: Dict[str, Any], notify_state_path: Path) -> None:
-    """Notify-only: never downloads or writes anything except the tiny
-    marker file at notify_state_path, which just remembers the last version
-    we already sent a Discord notification for - without it, a script that
-    runs every few minutes would re-notify on every single run for however
-    long you take to update by hand."""
+    """By default, notify-only: never downloads or writes anything except
+    the tiny marker file at notify_state_path, which just remembers the
+    last version we already sent a Discord notification for - without it,
+    a script that runs every few minutes would re-notify on every single
+    run for however long you take to update by hand.
+
+    If update.delete_self_on_update is true, this also deletes
+    queue_manager.py itself once a newer version is detected - see
+    delete_self_for_update()'s docstring for what that requires."""
     if not update_cfg.get("check_for_updates", True):
         return
 
@@ -1099,6 +1144,8 @@ def check_for_updates(update_cfg: Dict[str, Any], notify_state_path: Path) -> No
         log(f"[Update] {e}; skipping.")
         return
 
+    delete_self = bool(update_cfg.get("delete_self_on_update", False))
+
     last_notified = ""
     try:
         if notify_state_path.exists():
@@ -1108,17 +1155,21 @@ def check_for_updates(update_cfg: Dict[str, Any], notify_state_path: Path) -> No
 
     if last_notified == remote_version:
         log(f"[Update] Version {remote_version} is available (current: {VERSION}) - already notified, not repeating.")
-        return
+    else:
+        log(f"[Update] New version available: {VERSION} -> {remote_version}.")
+        remote_changelog = fetch_raw(repo, branch, path_prefix, "CHANGELOG.md") or ""
+        changelog_excerpt = extract_changelog_since(remote_changelog, VERSION) if remote_changelog else ""
+        send_update_available_notification(VERSION, remote_version, changelog_excerpt, delete_self)
+        try:
+            notify_state_path.write_text(remote_version)
+        except Exception as e:
+            log(f"[Update] Could not persist notified-version marker: {e}")
 
-    log(f"[Update] New version available: {VERSION} -> {remote_version}.")
-    remote_changelog = fetch_raw(repo, branch, path_prefix, "CHANGELOG.md") or ""
-    changelog_excerpt = extract_changelog_since(remote_changelog, VERSION) if remote_changelog else ""
-    send_update_available_notification(VERSION, remote_version, changelog_excerpt)
-
-    try:
-        notify_state_path.write_text(remote_version)
-    except Exception as e:
-        log(f"[Update] Could not persist notified-version marker: {e}")
+    # Retried on every run (not gated by the notify dedup above) so a
+    # transient failure to delete (e.g. a permissions hiccup) self-heals on
+    # the next run instead of leaving the old version running forever.
+    if delete_self:
+        delete_self_for_update(remote_version)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
