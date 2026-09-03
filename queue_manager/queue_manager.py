@@ -620,10 +620,17 @@ def delete_arr_queue_item(base_url: str, api_key: str, queue_id: Any, remove_fro
         return False
 
 
-def calculate_rank(item: Dict[str, Any]) -> Tuple[int, int]:
+def calculate_rank(item: Dict[str, Any], progress: float = 0.0) -> Tuple[int, int, float]:
+    """(customFormatScore, quality resolution, live qBit progress). Progress
+    is last so it never overrides a genuine CF/quality difference - it only
+    breaks a true tie. Without it, two items tied on score and quality sort
+    by Python's stable-sort fallback, i.e. whatever order Arr's queue API
+    happened to return them in - which has no relationship to which one is
+    actually further along in qBit, and can pick a freshly-grabbed duplicate
+    as the 'winner' over a release that's already mostly downloaded."""
     score = item.get("customFormatScore", 0)
     quality_weight = item.get("quality", {}).get("quality", {}).get("resolution", 0)
-    return (score, quality_weight)
+    return (score, quality_weight, progress)
 
 
 def attempt_pause_and_read_progress(proxy_client: QBitProxyClient, torrent_hash: str):
@@ -684,7 +691,23 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
         if len(fresh_items) <= 1:
             continue
 
-        fresh_items.sort(key=calculate_rank, reverse=True)
+        # Only needed to break ties (see calculate_rank's docstring), but
+        # cheap enough (read-only qBit lookup, no pause) to fetch for every
+        # candidate up front rather than special-casing the tied ones.
+        item_progress: Dict[str, float] = {}
+        for i in fresh_items:
+            dl_id = (i.get("downloadId") or "").lower()
+            if not dl_id:
+                continue
+            live = proxy_client.get_live_torrent(dl_id)
+            if live and "progress" in live:
+                p = float(live["progress"])
+                item_progress[dl_id] = p if p <= 1.0 else p / 100.0
+
+        fresh_items.sort(
+            key=lambda i: calculate_rank(i, item_progress.get((i.get("downloadId") or "").lower(), 0.0)),
+            reverse=True,
+        )
         winner_item = fresh_items[0]
         winner_name = winner_item.get("title") or winner_item.get("downloadId", "unknown release")
         winner_score = winner_item.get("customFormatScore", 0)
