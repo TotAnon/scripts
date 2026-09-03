@@ -3,10 +3,26 @@
 All notable changes to `queue_manager` are documented here. Versions follow
 `MAJOR.MINOR.PATCH`. On every run (when `settings.update.check_for_updates`
 is enabled), the script compares its own `VERSION` against this file's
-latest entry on the configured GitHub branch and, if newer, updates itself -
-see the `update.*` config keys in `queue_manager.yml` for the source repo/
-branch, and the "Self-update" section in `queue_manager.py` for exactly what
-that does to your files.
+latest entry on the configured GitHub branch and, if newer, posts a Discord
+notification with the changelog since your version - see the `update.*`
+config keys in `queue_manager.yml` for the source repo/branch, and the
+"Update check (notify-only)" section in `queue_manager.py`. It never
+downloads or changes any file - you still update by hand.
+
+## [1.1.0] - 2026-09-03
+
+### Changed
+- Replaced the auto-apply update mechanism (1.0.1/1.0.2) with a
+  notify-only check, matching TRaSH-Guides' own mover-tuning script:
+  compares `VERSION` against the configured branch and posts a Discord
+  notification (once per new version, not every run) when one is newer.
+  Nothing is downloaded, nothing on disk is touched - you update by hand.
+- Dropped the `ruamel.yaml` dependency entirely. Only `requests` + `pyyaml`
+  are needed now, same as before any of this existed.
+
+### Removed
+- The config-diff/merge machinery and atomic file-replacement logic from
+  1.0.1 - no longer applicable now that updates aren't auto-applied.
 
 ## [1.0.2] - 2026-09-03
 
