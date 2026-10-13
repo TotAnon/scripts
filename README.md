@@ -5,6 +5,12 @@ Random scripts I use in unraid
 
 I use Unraid
 
+| Script | What it does |
+|---|---|
+| [radarr_cf_report](radarr_cf_report) | Radarr custom format report (setup below) |
+| [queue_manager](queue_manager) | Queue manager for Radarr/Sonarr/qBittorrent via qui |
+| [diskio_monitor](diskio_monitor) | Watches array disk I/O, works out what's keeping disks busy (containers, torrents), and reports to Discord. Setup is in [its own README](diskio_monitor/README.md) |
+
 # radarr_cf_report.py:
 
 mkdir /mnt/user/appdata/scripts/reports
