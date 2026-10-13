@@ -1,7 +1,7 @@
 # scripts
-I have no idea what I'm doing. Grok made these.
+I have no idea what I'm doing. Claude made these with my ideas.
 
-random scripts i use in unraid
+Random scripts I use in unraid
 
 I use Unraid
 
