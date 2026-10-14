@@ -61,7 +61,7 @@ In **Settings → User Scripts**, add a new script and replace its contents with
 
 ### 3. Configure
 
-Edit the settings block at the top of the user script. At minimum, replace the placeholder `DISCORD_WEBHOOK_URL` with your own webhook. Keep your filled-in copy private: the webhook URL and qui proxy keys work as passwords. For qBittorrent, see the next section, or set `QBIT_ENABLED=false`.
+Edit the settings block at the top of the user script. At minimum, replace the placeholder `DISCORD_WEBHOOK_URL` with your own webhook. Keep your filled-in copy private: the webhook URL, qui proxy keys and `QUI_API_KEY` work as passwords. For qBittorrent, see the next section, or set `QBIT_ENABLED=false`.
 
 ### 4. Schedule and start
 
@@ -107,6 +107,8 @@ TRACKER_ALIASES=(
 )
 ```
 
+Alternatively, set `QUI_API_KEY` (qui → **Settings → API Keys**) to use the display names and domain merges from qui's tracker customizations; names are refreshed with each alert interval. Aliases take priority over qui's names.
+
 **Tiers.** Torrents tagged like `tier 1`, `Tier 2` or `tier3` are grouped by tier. Change `TIER_TAG_REGEX` if your tags differ.
 
 ## Configuration reference
@@ -128,6 +130,7 @@ All settings live in the user script.
 | `STATE_DIR` | `/mnt/user/appdata/scripts/diskio_monitor` | Program, state and history location |
 | `QBIT_ENABLED` | `true` | qBittorrent features on or off |
 | `QUI_CONTAINER_NAME` | `qui` | Name of the qui container |
+| `QUI_API_KEY` | (blank) | Optional; tracker names from qui's tracker customizations |
 | `QBIT_INSTANCES` | | One `label\|proxy_url[\|path_map]` per instance |
 | `QBIT_PATH_MAP` | `/data=/mnt/user/data` | Container path → host path; `;`-separated for several |
 | `POOL_NAMES` | `cache` | Pool(s) downloads land on before mover |
@@ -179,7 +182,7 @@ This is read-only and safe while the monitor is running.
 | `diskio_monitor.log` | `/var/log` | Activity log |
 | `qbit_*.json` | `/tmp/diskio_monitor` | qBittorrent sync cache (RAM, rebuilt as needed) |
 
-**Updating:** stop the script in User Scripts, download the latest `diskio_monitor.py` with the `curl` command from step 1, and start it again. Your settings live in the user script, so they aren't touched, and state carries over.
+**Updating:** stop the script in User Scripts, download the latest `diskio_monitor.py` with the `curl` command from step 1, and start it again. Your settings live in the user script, so they aren't touched, and state carries over. If a new version adds settings (like `QUI_API_KEY`), copy those lines from the latest [`user_script.sh`](user_script.sh) into yours.
 
 **Resetting:** stop the script, delete `state.json` (and `test_history.jsonl` to also clear past tests), and start it again.
 
@@ -194,10 +197,11 @@ This is read-only and safe while the monitor is running.
 | `qBittorrent instance '…' NOT reachable` | Check `QUI_CONTAINER_NAME` and the proxy key; run the check command above |
 | `Discord send FAILED (HTTP 404)` | The webhook URL is wrong or was deleted |
 | `Stream snapshot skipped: lsof exceeded 20s` | Raise `STREAM_LSOF_TIMEOUT`, or set `STREAMS_ENABLED=false` |
+| `Could not read Qui tracker customizations` | Check `QUI_API_KEY`, or leave it blank |
 | `No physical disks found` | Check `MONITOR_NAME_REGEX`; the array must be started |
 
 ## Notes and limitations
 
 - The script runs as a background process. Measuring costs a single read of `/proc/diskstats` per sample, which never touches the disks; the `lsof` pass runs at the lowest CPU and I/O priority.
 - Array vs. pool detection checks only pool paths, so it never wakes array disks. It assumes your shares follow the standard Unraid layout (`/mnt/<pool>/<share>/…`).
-- qBittorrent's API reports which tracker URL a torrent is currently using. If a torrent fails over between two URLs that resolve to different names, its upload is split between them unless they're merged with an alias.
+- qBittorrent's API reports which tracker URL a torrent is currently using. If a torrent fails over between two URLs that resolve to different names, its upload is split between them unless they're merged with an alias or in qui.
