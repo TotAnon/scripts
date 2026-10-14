@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 
 # ================================================================== settings
