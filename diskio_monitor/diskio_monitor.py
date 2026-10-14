@@ -89,6 +89,7 @@ STATE_DIR = _env("STATE_DIR", "/mnt/user/appdata/scripts/diskio_monitor")
 SAVE_INTERVAL = _int("STATE_SAVE_INTERVAL_SEC", 300)
 QBIT_ENABLED = _bool("QBIT_ENABLED", True)
 QUI_CONTAINER = _env("QUI_CONTAINER_NAME", "qui")
+QUI_API_KEY = _env("QUI_API_KEY", "")
 PATH_MAP = _env("QBIT_PATH_MAP", "/data=/mnt/user/data")
 POOL_NAMES = _list("POOL_NAMES", ["cache"])
 TIER_TAG_REGEX = _env("TIER_TAG_REGEX", r"^tier ?(?<n>[0-9]+)$")
@@ -629,7 +630,51 @@ def qbit_collect():
             QB_LAST[label] = process_maindata(st, data, now)
 
 
+QUI_NAMES = {}   # tracker domain -> display name, from Qui's tracker customizations
+
+
+def qui_base():
+    for inst in INSTANCES:
+        if "/proxy/" in inst["url"]:
+            return inst["url"].split("/proxy/")[0]
+    return "http://localhost:7476"
+
+
+def refresh_qui_names():
+    """Loads tracker display names (and merged domains) from Qui's tracker customizations.
+    Needs QUI_API_KEY; keeps the previous names if Qui can't be read."""
+    if not QUI_API_KEY:
+        return
+    url = qui_base() + "/api/tracker-customizations"
+    try:
+        r = subprocess.run(["docker", "exec", QUI_CONTAINER, "wget", "-qO-", "-T", "20",
+                            "--header", f"X-API-Key: {QUI_API_KEY}", url],
+                           capture_output=True, timeout=25)
+        data = json.loads(r.stdout) if r.returncode == 0 and r.stdout else None
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("customizations") or data.get("items")
+    if not isinstance(data, list):
+        log("Could not read Qui tracker customizations - check QUI_API_KEY. Keeping current tracker names.")
+        return
+    names = {}
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        disp = c.get("displayName") or c.get("display_name") or c.get("name")
+        for d in c.get("domains") or []:
+            if disp and isinstance(d, str) and d.strip():
+                names[d.strip().lower()] = str(disp)
+    if names != QUI_NAMES:
+        QUI_NAMES.clear()
+        QUI_NAMES.update(names)
+        TRKNAME_CACHE.clear()
+        log(f"Loaded {len(set(names.values()))} tracker names from Qui ({len(names)} domains).")
+
+
 def tracker_name(host):
+    """Display name: TRACKER_ALIASES, then Qui's tracker customizations, then derived from the hostname."""
     if host in TRKNAME_CACHE:
         return TRKNAME_CACHE[host]
     name = ""
@@ -638,6 +683,13 @@ def tracker_name(host):
         if sub and sub in host:
             name = disp
             break
+    if not name and QUI_NAMES:
+        parts = host.split(".")
+        for i in range(len(parts) - 1):   # tracker.example.org also matches a Qui domain of example.org
+            suffix = ".".join(parts[i:])
+            if suffix in QUI_NAMES:
+                name = QUI_NAMES[suffix]
+                break
     if not name:
         parts = host.split(".")
         if host == "-":
@@ -1515,6 +1567,7 @@ def run():
             if os.path.isdir(old):
                 shutil.rmtree(old, ignore_errors=True)
         load_qbit_state()
+        refresh_qui_names()
         for inst in INSTANCES:
             ok = bool(qbit_fetch(f"{inst['url']}/api/v2/app/version"))
             log(f"qBittorrent instance '{inst['label']}' "
@@ -1586,6 +1639,8 @@ def run():
         dirty = False
         if NOW >= ST["next"]["interval"]:
             interval_report()
+            if QBIT_ENABLED:
+                refresh_qui_names()
             ST["windows"]["interval"] = new_window(NOW)
             ST["next"]["interval"] = next_boundary(interval_sec("interval"), NOW)
             dirty = True

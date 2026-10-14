@@ -15,7 +15,7 @@
 set -a   # every setting below is passed to the Python program
 
 ### ---- SETTINGS ---- ###
-DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX"   # REQUIRED
 THRESHOLD_PERCENT=85        # %util a disk must hit to count as "over" for that sample
 SAMPLE_SECONDS=30           # target length of each %util sample
 COMPILE_MINUTES=240         # interval alert window, clock-aligned to midnight (e.g. 60, 120, 240)
@@ -40,6 +40,9 @@ STATE_SAVE_INTERVAL_SEC=300
 QBIT_ENABLED=true
 # Qui is reached via `docker exec` into Qui's own container.
 QUI_CONTAINER_NAME="qui"
+# Optional: a Qui API key (Qui -> Settings -> API Keys) makes reports use the tracker names and
+# domain merges from Qui's tracker customizations. Blank = names from TRACKER_ALIASES / hostnames.
+QUI_API_KEY=""
 # One entry per qBittorrent instance: "label|proxy_url" or "label|proxy_url|path_map".
 # Proxy URL: Qui -> Settings -> Client Proxy -> create a key per instance, with localhost as host:
 #   http://localhost:7476/proxy/<key>
@@ -56,7 +59,8 @@ POOL_NAMES=("cache")       # pool(s) new downloads land on before mover runs (e.
 TIER_TAG_REGEX='^tier ?(?<n>[0-9]+)$'
 RATIO_SPLIT=2.0            # tier upload is split into below / at-or-above this ratio
 NEW_TORRENT_DAYS=7         # torrents younger than this count as "fresh"
-# Optional tracker display names: "hostname-substring|Name". Default: derived from the hostname.
+# Optional tracker display names: "hostname-substring|Name". These override Qui's names;
+# without Qui or an alias, names are derived from the hostname.
 TRACKER_ALIASES=()
 
 # Array stream attribution (daily and rollup reports): which containers have files open on
