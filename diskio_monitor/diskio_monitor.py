@@ -103,6 +103,7 @@ STREAM_TOP_N = _int("STREAM_TOP_N", 8)
 LSOF_TIMEOUT = _int("STREAM_LSOF_TIMEOUT", 20)
 LOG_FILE = _env("LOG_FILE", "/var/log/diskio_monitor.log")
 LOG_MAX_BYTES = _int("LOG_MAX_BYTES", 10 * 1024 * 1024)
+UPDATE_CHECK = _bool("UPDATE_CHECK", True)
 
 INSTANCES = []
 for _e in _list("QBIT_INSTANCES", []):
@@ -118,6 +119,9 @@ DISKS_INI = _env("DIM_DISKS_INI", "/var/local/emhttp/disks.ini")
 PROC_DIR = _env("DIM_PROC", "/proc")
 MNT_ROOT = _env("DIM_MNT", "/mnt")
 WORK_DIR = _env("DIM_WORK", "/tmp/diskio_monitor")
+UPDATE_URL = _env("DIM_UPDATE_URL",
+                  "https://raw.githubusercontent.com/TotAnon/scripts/main/diskio_monitor/diskio_monitor.py")
+README_URL = "https://github.com/TotAnon/scripts/tree/main/diskio_monitor#readme"
 DOWNTIME_REPORT_MIN_SEC = 300
 
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
@@ -1244,16 +1248,45 @@ def interval_report():
             ST["last_notify"] = NOW
 
 
-def summary_report(window_name, title, color, with_corr=False):
+def summary_report(window_name, title, color, with_corr=False, note=""):
     w = ST["windows"][window_name]
     fields, _ = disk_fields(w, "summary")
     fields += qbit_detail_fields(w) + upload_field(w) + tier_field(w) + stream_field(w)
     if with_corr:
         fields += corr_field(w)
     log(f"{title} compiled.")
-    if send_embed(title, period_label(w), color, fields, footer_text(window_name, w)):
+    desc = period_label(w) + (f"\n\n{note}" if note else "")
+    if send_embed(title, desc, color, fields, footer_text(window_name, w)):
         log(f"Sent: {title}")
         ST["last_notify"] = NOW
+
+
+# ================================================================== update check
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def update_note():
+    """A reminder line for the daily summary while a newer version is on GitHub, else ''.
+    Checked once a day; any failure just skips the reminder."""
+    if not UPDATE_CHECK:
+        return ""
+    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": f"diskio-monitor/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            text = r.read(65536).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
+        log(f"Update check failed: {e}")
+        return ""
+    m = re.search(r'^VERSION\s*=\s*["\']([\d.]+)["\']', text, re.MULTILINE)
+    if not m:
+        log("Update check: no VERSION found in the GitHub copy.")
+        return ""
+    latest = m.group(1)
+    if _version_tuple(latest) <= _version_tuple(VERSION):
+        return ""
+    log(f"Update available: v{VERSION} -> v{latest}.")
+    return f"🔔 **Update available:** v{VERSION} → v{latest}. [How to update]({README_URL})"
 
 
 # ================================================================== tests
@@ -1645,7 +1678,7 @@ def run():
             ST["next"]["interval"] = next_boundary(interval_sec("interval"), NOW)
             dirty = True
         if NOW >= ST["next"]["daily"]:
-            summary_report("daily", f"📊 Daily Disk I/O Summary — {HOST}", COLOR_DAILY)
+            summary_report("daily", f"📊 Daily Disk I/O Summary — {HOST}", COLOR_DAILY, note=update_note())
             post_tracker_message(ST["windows"]["daily"], "Daily")
             ST["windows"]["daily"] = new_window(NOW)
             LOC_CACHE.clear()   # daily safety net for location changes
