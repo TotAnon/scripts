@@ -41,7 +41,10 @@ from datetime import datetime, timezone
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.1"
+VERSION = "2.1.1"
+# Bump with any release that changes how test results are measured or calculated, so the
+# update reminder can warn that updating mid-test mixes old and new numbers.
+MEASUREMENT_VERSION = 1
 
 
 # ================================================================== settings
@@ -121,7 +124,8 @@ MNT_ROOT = _env("DIM_MNT", "/mnt")
 WORK_DIR = _env("DIM_WORK", "/tmp/diskio_monitor")
 UPDATE_URL = _env("DIM_UPDATE_URL",
                   "https://raw.githubusercontent.com/TotAnon/scripts/main/diskio_monitor/diskio_monitor.py")
-README_URL = "https://github.com/TotAnon/scripts/tree/main/diskio_monitor#readme"
+README_URL = "https://github.com/TotAnon/scripts/tree/main/diskio_monitor#updating"
+CHANGELOG_URL = "https://github.com/TotAnon/scripts/blob/main/diskio_monitor/CHANGELOG.md"
 DOWNTIME_REPORT_MIN_SEC = 300
 
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
@@ -1285,8 +1289,18 @@ def update_note():
     latest = m.group(1)
     if _version_tuple(latest) <= _version_tuple(VERSION):
         return ""
-    log(f"Update available: v{VERSION} -> v{latest}.")
-    return f"🔔 **Update available:** v{VERSION} → v{latest}. [How to update]({README_URL})"
+    note = (f"🔔 **Update available:** v{VERSION} → v{latest} · [What's new]({CHANGELOG_URL})"
+            f" · [How to update]({README_URL})")
+    mv = re.search(r"^MEASUREMENT_VERSION\s*=\s*(\d+)", text, re.MULTILINE)
+    if mv and int(mv.group(1)) > MEASUREMENT_VERSION:
+        day = (NOW - ST["windows"]["test"]["START"]) // 86400 + 1
+        note += (f"\n⚠️ **This update changes how results are measured.** {ST['test_name']} is on day {day}; "
+                 f"updating now mixes old and new numbers in it. Consider waiting until this test ends and "
+                 f"updating when you start the next one. Not sure? Ask on Discord before updating.")
+        log(f"Update available: v{VERSION} -> v{latest} (changes measurements).")
+    else:
+        log(f"Update available: v{VERSION} -> v{latest}.")
+    return note
 
 
 # ================================================================== tests
