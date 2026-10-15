@@ -27,7 +27,7 @@ Reports are Discord embeds, so they read cleanly on desktop and mobile.
 - **Tiers.** If you tag torrents by tier (e.g. with qui automations), reports show each tier's share of upload, the split above and below a ratio target, and how often capped torrents sit at their limit.
 - **Test mode with normalization.** Each test is saved with per-day figures, demand indicators (swarm leechers, new torrents) and efficiency ratios (disk minutes over threshold per 10 active uploads, and per 100 GB uploaded from the array). Comparisons flag when demand differed enough between tests that raw totals aren't comparable.
 - **Robust state.** Totals and the report schedule survive restarts, edits, and reboots. Offline time is flagged in reports instead of silently skewing them.
-- **Update reminders.** Once a day the script checks GitHub for a newer version, and while one is available the daily summary starts with a 🔔 reminder linking to the update steps. Nothing is downloaded or changed for you.
+- **Update reminders.** Once a day the script checks GitHub for a newer version, and while one is available the daily summary starts with a 🔔 reminder linking to what's new and the update steps. If the update changes how results are measured, the reminder warns you so you can finish the current test first. Nothing is downloaded or changed for you.
 - **Privacy.** Tracker passkeys are stripped the moment data arrives and are never stored or sent.
 
 ## Requirements
@@ -143,7 +143,7 @@ All settings live in the user script.
 | `STREAM_SHARES` | `data` | User shares to attribute streams for (only the array portion is counted) |
 | `STREAM_TOP_N` | `8` | Containers listed in the streams field |
 | `STREAM_LSOF_TIMEOUT` | `20` | Skip a stream snapshot if `lsof` takes longer |
-| `UPDATE_CHECK` | `true` | Daily check for a newer version on GitHub, shown as a reminder in the daily summary |
+| `UPDATE_CHECK` | `true` | Daily check for a newer version on GitHub, shown as a reminder in the daily summary (see [Updating](#updating)) |
 | `LOG_FILE` | `/var/log/diskio_monitor.log` | Log location (rotated daily or at 10 MB) |
 
 ## Running tests
@@ -184,11 +184,30 @@ This is read-only and safe while the monitor is running.
 | `diskio_monitor.log` | `/var/log` | Activity log |
 | `qbit_*.json` | `/tmp/diskio_monitor` | qBittorrent sync cache (RAM, rebuilt as needed) |
 
-**Updating:** stop the script in User Scripts, download the latest `diskio_monitor.py` with the `curl` command from step 1, and start it again. Your settings live in the user script, so they aren't touched, and state carries over. If a new version adds settings (like `QUI_API_KEY`), copy those lines from the latest [`user_script.sh`](user_script.sh) into yours.
-
 **Resetting:** stop the script, delete `state.json` (and `test_history.jsonl` to also clear past tests), and start it again.
 
-**Upgrading from the bash version:** stop the old script first. On first start, its `state.sh` is migrated to `state.json` automatically, and the original is kept as `state.sh.migrated`.
+## Updating
+
+When a newer version is on GitHub, the daily summary starts with a 🔔 reminder. See the [changelog](CHANGELOG.md) for what changed.
+
+1. Stop the script in User Scripts.
+2. Download the latest program with the `curl` command from [step 1](#1-copy-the-program-to-your-appdata).
+3. Start the script again. The log shows `Started v…` with the new version.
+
+Your settings live in the user script, so they aren't touched. `state.json` and `test_history.jsonl` aren't touched either: as long as you don't change `TEST_NAME`, the current test carries on. The minutes the script was stopped are unsampled and show as offline time in the report footer; test figures are averaged over sampled time only, so a short stop doesn't skew them.
+
+If a new version adds settings, copy those lines from the latest [`user_script.sh`](user_script.sh) into yours. Until you do, they use their defaults.
+
+**Updates that change measurements.** Some updates change how disk load, upload or other test figures are measured. Updating in the middle of a test then mixes old and new numbers in that test. The reminder says so (⚠️ *This update changes how results are measured*), and the changelog marks these releases. For clean results, wait until the current test ends and update when you start the next one (change `TEST_NAME` at the same restart). If you're not sure whether to wait, [open an issue](https://github.com/TotAnon/scripts/issues) and ask.
+
+### Updating from the bash version
+
+The bash version was a single script in User Scripts and doesn't use `diskio_monitor.py`, so downloading the program alone isn't enough, and the bash version has no update reminder.
+
+1. Stop the old script in User Scripts.
+2. Download `diskio_monitor.py` with the `curl` command from [step 1](#1-copy-the-program-to-your-appdata). It must go in the folder where the bash version kept its `state.sh` (`/mnt/user/appdata/scripts/diskio_monitor` by default); if yours is elsewhere, change the path in the command.
+3. Replace the whole User Scripts entry with the new [`user_script.sh`](user_script.sh) and copy your settings (webhook URL, threshold, qBittorrent instances and so on) into it. Set `STATE_DIR` to that same folder.
+4. Start it. On first start, `state.sh` is converted to `state.json` and the original is kept as `state.sh.migrated`. Your totals and current test carry over.
 
 ## Troubleshooting
 
