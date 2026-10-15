@@ -70,6 +70,9 @@ STREAM_SHARES=("data")     # user shares to attribute streams for
 STREAM_TOP_N=8             # max containers listed in the streams field
 STREAM_LSOF_TIMEOUT=20     # seconds; that sample's stream snapshot is skipped if lsof takes longer
 
+# Once a day, check GitHub for a newer diskio_monitor.py and add a reminder to the daily summary.
+UPDATE_CHECK=true
+
 LOG_FILE="/var/log/diskio_monitor.log"
 LOG_MAX_BYTES=$((10 * 1024 * 1024))   # 10MB - rotate on size cap or new day, keep 1 backup
 ### ------------------ ###

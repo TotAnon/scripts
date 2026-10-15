@@ -10,7 +10,7 @@ It measures per-disk utilization every 30 seconds with no gaps, ties disk spikes
 |---|---|---|
 | ⚠️ **Disk I/O alert** | Every interval (default 4 h), only if a disk crossed the threshold | Each disk's average utilization and share of time over the threshold, plus qBittorrent upload speed and active uploads |
 | ✅ **Still monitoring** | After a quiet stretch (default 12 h) | Same layout, as a heartbeat |
-| 📊 **Daily summary** | Midnight | Per-disk load, with the containers that had files open on each hot disk · qBittorrent overall vs. during spikes · GB uploaded (array vs. pool, fresh vs. old torrents, new torrents) · upload by tier · array streams by container |
+| 📊 **Daily summary** | Midnight | Per-disk load, with the containers that had files open on each hot disk · qBittorrent overall vs. during spikes · GB uploaded (array vs. pool, fresh vs. old torrents, new torrents) · upload by tier · array streams by container · 🔔 reminder when a newer version is on GitHub |
 | 📡 **Tracker breakdown** | After each daily and rollup report | Every tracker grouped by tier: active uploads, GB uploaded, average speed, time at upload cap |
 | 🗓️ **Rollup** | Every 7 days (configurable) | Daily summary over the whole period, plus which factor moves with disk load (active uploads, peers, or upload speed) |
 | 🧪 **Test comparison** | When a test ends, with each rollup, or on demand | Up to several tests side by side: disk load, demand, upload, normalized load, tier shares |
@@ -27,6 +27,7 @@ Reports are Discord embeds, so they read cleanly on desktop and mobile.
 - **Tiers.** If you tag torrents by tier (e.g. with qui automations), reports show each tier's share of upload, the split above and below a ratio target, and how often capped torrents sit at their limit.
 - **Test mode with normalization.** Each test is saved with per-day figures, demand indicators (swarm leechers, new torrents) and efficiency ratios (disk minutes over threshold per 10 active uploads, and per 100 GB uploaded from the array). Comparisons flag when demand differed enough between tests that raw totals aren't comparable.
 - **Robust state.** Totals and the report schedule survive restarts, edits, and reboots. Offline time is flagged in reports instead of silently skewing them.
+- **Update reminders.** Once a day the script checks GitHub for a newer version, and while one is available the daily summary starts with a 🔔 reminder linking to the update steps. Nothing is downloaded or changed for you.
 - **Privacy.** Tracker passkeys are stripped the moment data arrives and are never stored or sent.
 
 ## Requirements
@@ -142,6 +143,7 @@ All settings live in the user script.
 | `STREAM_SHARES` | `data` | User shares to attribute streams for (only the array portion is counted) |
 | `STREAM_TOP_N` | `8` | Containers listed in the streams field |
 | `STREAM_LSOF_TIMEOUT` | `20` | Skip a stream snapshot if `lsof` takes longer |
+| `UPDATE_CHECK` | `true` | Daily check for a newer version on GitHub, shown as a reminder in the daily summary |
 | `LOG_FILE` | `/var/log/diskio_monitor.log` | Log location (rotated daily or at 10 MB) |
 
 ## Running tests
@@ -198,6 +200,7 @@ This is read-only and safe while the monitor is running.
 | `Discord send FAILED (HTTP 404)` | The webhook URL is wrong or was deleted |
 | `Stream snapshot skipped: lsof exceeded 20s` | Raise `STREAM_LSOF_TIMEOUT`, or set `STREAMS_ENABLED=false` |
 | `Could not read Qui tracker customizations` | Check `QUI_API_KEY`, or leave it blank |
+| `Update check failed: …` | GitHub couldn't be reached; the reminder is skipped that day. Set `UPDATE_CHECK=false` to stop checking |
 | `No physical disks found` | Check `MONITOR_NAME_REGEX`; the array must be started |
 
 ## Notes and limitations
