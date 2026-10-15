@@ -198,7 +198,7 @@ Your settings live in the user script, so they aren't touched. `state.json` and 
 
 If a new version adds settings, copy those lines from the latest [`user_script.sh`](user_script.sh) into yours. Until you do, they use their defaults.
 
-**Updates that change measurements.** Some updates change how disk load, upload or other test figures are measured. Updating in the middle of a test then mixes old and new numbers in that test. The reminder says so (⚠️ *This update changes how results are measured*), and the changelog marks these releases. For clean results, wait until the current test ends and update when you start the next one (change `TEST_NAME` at the same restart). If you're not sure whether to wait, [open an issue](https://github.com/TotAnon/scripts/issues) and ask.
+**Updates that change measurements.** Some updates change how disk load, upload or other test figures are measured. Updating in the middle of a test then mixes old and new numbers in that test. The reminder says so (⚠️ *This update changes how results are measured*), and the changelog marks these releases. For clean results, wait until the current test ends and update when you start the next one (change `TEST_NAME` at the same restart). If you're not sure whether to wait, ask on Discord before updating.
 
 ### Updating from the bash version
 

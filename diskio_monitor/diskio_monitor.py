@@ -126,7 +126,6 @@ UPDATE_URL = _env("DIM_UPDATE_URL",
                   "https://raw.githubusercontent.com/TotAnon/scripts/main/diskio_monitor/diskio_monitor.py")
 README_URL = "https://github.com/TotAnon/scripts/tree/main/diskio_monitor#updating"
 CHANGELOG_URL = "https://github.com/TotAnon/scripts/blob/main/diskio_monitor/CHANGELOG.md"
-ISSUES_URL = "https://github.com/TotAnon/scripts/issues"
 DOWNTIME_REPORT_MIN_SEC = 300
 
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
@@ -1297,7 +1296,7 @@ def update_note():
         day = (NOW - ST["windows"]["test"]["START"]) // 86400 + 1
         note += (f"\n⚠️ **This update changes how results are measured.** {ST['test_name']} is on day {day}; "
                  f"updating now mixes old and new numbers in it. Consider waiting until this test ends and "
-                 f"updating when you start the next one. Not sure? [Ask for guidance]({ISSUES_URL}).")
+                 f"updating when you start the next one. Not sure? Ask on Discord before updating.")
         log(f"Update available: v{VERSION} -> v{latest} (changes measurements).")
     else:
         log(f"Update available: v{VERSION} -> v{latest}.")
