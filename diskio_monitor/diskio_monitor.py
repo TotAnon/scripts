@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.2"
+VERSION = "2.1.1"
 # Bump with any release that changes how test results are measured or calculated, so the
 # update reminder can warn that updating mid-test mixes old and new numbers.
 MEASUREMENT_VERSION = 1
