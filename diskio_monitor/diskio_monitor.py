@@ -41,10 +41,10 @@ from datetime import datetime, timezone
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 # Bump with any release that changes how test results are measured or calculated, so the
 # update reminder can warn that updating mid-test mixes old and new numbers.
-MEASUREMENT_VERSION = 1
+MEASUREMENT_VERSION = 2
 
 
 # ================================================================== settings
@@ -589,7 +589,14 @@ def process_maindata(st, data, now):
     speed = active = peers = swarm = 0
     fresh_after = now - NEW_TORRENT_DAYS * 86400
     records = []
+    learn = {}   # tracker host -> {tier: tagged torrent count}
     for h, t in new.items():
+        host = t.get("tracker") or "-"
+        if t.get("tags") and host != "-":
+            tagged_tier = tier_of(t.get("tags"))
+            if tagged_tier != "none":
+                counts = learn.setdefault(host, {})
+                counts[tagged_tier] = counts.get(tagged_tier, 0) + 1
         sp = to_int(t.get("upspeed"))
         speed += sp
         if sp > 0:
@@ -617,7 +624,7 @@ def process_maindata(st, data, now):
             "path": t.get("content_path") or ""})
     st["baseline"] = True
     return {"ok": True, "speed": speed, "active": active, "peers": peers, "swarm": swarm,
-            "alltime": st["alltime"], "records": records}
+            "alltime": st["alltime"], "records": records, "learn": learn}
 
 
 def qbit_collect():
@@ -747,6 +754,21 @@ def acc_qbit(over_any, disk_valid, array_util):
     tot_speed = tot_active = peers = swarm = alltime_delta = 0
     s = {k: {} for k in TRK_ARRAYS + TIER_ARRAYS}
     tb = fb = ab = pb = ub = new_count = new_size = 0
+    # Tiers are assigned per tracker, so an untagged torrent (e.g. new, not yet tagged by an
+    # automation) inherits the tier its tracker's tagged torrents have - by hostname, or failing
+    # that by tracker display name (covers a tracker's other announce domains).
+    tracker_tiers = ST.setdefault("tracker_tiers", {})
+    combined = {}
+    for inst in oks:
+        for host, counts in QB_LAST[inst["label"]].get("learn", {}).items():
+            c = combined.setdefault(host, {})
+            for tier, n in counts.items():
+                c[tier] = c.get(tier, 0) + n
+    for host, counts in combined.items():
+        tracker_tiers[host] = max(counts, key=counts.get)
+    name_tiers = {}
+    for host, tier in tracker_tiers.items():
+        name_tiers.setdefault(tracker_name(host), tier)
     for inst in oks:
         label = inst["label"]
         r = QB_LAST[label]
@@ -775,6 +797,8 @@ def acc_qbit(over_any, disk_valid, array_util):
             if not (b > 0 or sp > 0 or rec["crossed"]):
                 continue
             trk, tier = tracker_name(rec["host"]), rec["tier"]
+            if tier == "none":
+                tier = tracker_tiers.get(rec["host"]) or name_tiers.get(trk) or "none"
             tb += b
             if rec["fresh"]:
                 fb += b
