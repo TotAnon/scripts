@@ -8,11 +8,13 @@ is migrated automatically on first start and kept as state.sh.migrated.
 
 Every SAMPLE_SECONDS it measures each array disk's %util with no gaps between samples,
 and mid-sample reads qBittorrent (via Qui's client proxy, sync/maindata) and which
-containers have files open on the array (lsof).
+containers have files open on the array (lsof). Each sample also reads system RAM and,
+for every qBittorrent container, how much memory it needs vs. how much is cache.
 
 Reports
-  Interval alert (every COMPILE_MINUTES, only if a disk hit THRESHOLD_PERCENT):
-    per-disk average and time over threshold, plus qBittorrent activity.
+  Interval alert (every COMPILE_MINUTES, only if a disk hit THRESHOLD_PERCENT or average
+    RAM use crossed its threshold): per-disk average and time over threshold, qBittorrent
+    activity and RAM. A qBittorrent process killed for lack of memory is reported at once.
   Daily (00:00) and rollup (every WEEKLY_INTERVAL_DAYS): disks with stream owners,
     qBittorrent, upload (array vs pool, fresh, new torrents), upload by tier, array
     streams, and a second message with per-tracker stats. Rollups add which drivers
@@ -31,17 +33,19 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.1.2"
+VERSION = "2.2.0"
 # Bump with any release that changes how test results are measured or calculated, so the
 # update reminder can warn that updating mid-test mixes old and new numbers.
 MEASUREMENT_VERSION = 2
@@ -107,6 +111,9 @@ LSOF_TIMEOUT = _int("STREAM_LSOF_TIMEOUT", 20)
 LOG_FILE = _env("LOG_FILE", "/var/log/diskio_monitor.log")
 LOG_MAX_BYTES = _int("LOG_MAX_BYTES", 10 * 1024 * 1024)
 UPDATE_CHECK = _bool("UPDATE_CHECK", True)
+RAM_ENABLED = _bool("RAM_ENABLED", True)
+RAM_THRESHOLD = _int("RAM_THRESHOLD_PERCENT", 90)
+QBIT_RAM_THRESHOLD_GB = _float("QBIT_RAM_THRESHOLD_GB", 0)
 
 INSTANCES = []
 for _e in _list("QBIT_INSTANCES", []):
@@ -122,6 +129,11 @@ DISKS_INI = _env("DIM_DISKS_INI", "/var/local/emhttp/disks.ini")
 PROC_DIR = _env("DIM_PROC", "/proc")
 MNT_ROOT = _env("DIM_MNT", "/mnt")
 WORK_DIR = _env("DIM_WORK", "/tmp/diskio_monitor")
+MEMINFO_FILE = _env("DIM_MEMINFO", "/proc/meminfo")
+VMSTAT_FILE = _env("DIM_VMSTAT", "/proc/vmstat")
+PSI_MEM_FILE = _env("DIM_PSI_MEM", "/proc/pressure/memory")
+CGROUP_ROOT = _env("DIM_CGROUP", "/sys/fs/cgroup")
+CONTAINER_MATCH_RETRY_SEC = 900
 UPDATE_URL = _env("DIM_UPDATE_URL",
                   "https://raw.githubusercontent.com/TotAnon/scripts/main/diskio_monitor/diskio_monitor.py")
 README_URL = "https://github.com/TotAnon/scripts/tree/main/diskio_monitor#updating"
@@ -224,14 +236,19 @@ TIER_ARRAYS = ["TIER_ACTIVE", "TIER_SPEED", "TIER_BYTES", "TIER_BYTES_LT", "TIER
                "TIER_LIMITED", "TIER_ATCAP", "TIER_CROSSED"]
 QBIT_ARRAYS = ["QBIT_SUM_SPEED", "QBIT_SUM_ACTIVE", "QBIT_SAMPLE_COUNT",
                "QBIT_OVER_SUM_SPEED", "QBIT_OVER_SUM_ACTIVE", "QBIT_OVER_SAMPLE_COUNT"]
-ARRAY_KEYS = DISK_ARRAYS + STREAM_ARRAYS + TRK_ARRAYS + TIER_ARRAYS + QBIT_ARRAYS
+RAM_ARRAYS = ["QRAM_SAMPLES", "QRAM_REQ_SUM", "QRAM_CACHE_SUM", "QRAM_SHOWN_SUM", "QRAM_REQ_PEAK",
+              "QRAM_OVER_SAMPLES", "QRAM_DOVER_CACHE_SUM", "QRAM_DOVER_SAMPLES", "QRAM_OOM"]
+ARRAY_KEYS = DISK_ARRAYS + STREAM_ARRAYS + TRK_ARRAYS + TIER_ARRAYS + QBIT_ARRAYS + RAM_ARRAYS
 SCALAR_KEYS = (["AGG_SUM", "AGG_SAMPLES", "DOWNTIME_SEC", "STREAM_SAMPLES", "STREAM_OVER_SAMPLES",
                 "SAMPLED_MS", "MOVER_MS", "QB_BYTES", "TORRENT_BYTES", "FRESH_BYTES", "ARRAY_BYTES",
                 "POOL_BYTES", "UNKNOWN_BYTES", "QB_PEERS_SUM", "QB_SWARM_SUM", "NEW_COUNT", "NEW_SIZE",
                 "CORR_N", "CORR_SU", "CORR_SUU"]
                + [f"CORR_{a}_{b}" for b in ("SPD", "ACT", "PEER") for a in ("S", "SS", "SX")]
                + ["QBIT_SUM_SPEED_TOTAL", "QBIT_SUM_ACTIVE_TOTAL", "QBIT_SAMPLE_COUNT_TOTAL",
-                  "QBIT_OVER_SUM_SPEED_TOTAL", "QBIT_OVER_SUM_ACTIVE_TOTAL", "QBIT_OVER_SAMPLE_COUNT_TOTAL"])
+                  "QBIT_OVER_SUM_SPEED_TOTAL", "QBIT_OVER_SUM_ACTIVE_TOTAL", "QBIT_OVER_SAMPLE_COUNT_TOTAL"]
+               + ["RAM_SAMPLES", "RAM_USED_SUM", "RAM_USED_PEAK", "RAM_TOTAL", "RAM_OVER_SAMPLES",
+                  "RAM_STALL_US", "RAM_STALL_MS", "SYS_OOM",
+                  "CCORR_N", "CCORR_SU", "CCORR_SUU", "CCORR_S", "CCORR_SS", "CCORR_SX"])
 WINDOW_NAMES = ["interval", "daily", "weekly", "test"]
 BASH_PREFIX = {"interval": "", "daily": "DAILY_", "weekly": "WEEKLY_", "test": "TEST_"}
 BASH_START = {"interval": "WINDOW_START", "daily": "DAILY_START", "weekly": "WEEKLY_START", "test": "TEST_START"}
@@ -988,6 +1005,322 @@ def acc_streams(w, over_any, over_devs):
                 add(w["DISKCTR_SUM"], k, n)
 
 
+# ================================================================== RAM (system + qBittorrent containers)
+# qBittorrent memory comes from each container's cgroup, split three ways:
+#   required = anon + kernel + sock  (qBittorrent's own memory and peer buffers - not releasable)
+#   cache    = file                   (torrent data held in RAM - the kernel frees it when needed)
+#   shown    = usage - inactive_file  (what docker stats and the Unraid dashboard show)
+GIB = 1073741824
+_RAM_PREV = {}       # psi / vmstat counters from the previous sample
+_MATCH_TRIED = {"at": 0}
+_MATCH_WARNED = set()
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _kv(text, scale=1):
+    out = {}
+    for line in (text or "").splitlines():
+        p = line.replace(":", " ").split()
+        if len(p) >= 2:
+            try:
+                out[p[0]] = int(p[1]) * scale
+            except ValueError:
+                pass
+    return out
+
+
+def read_meminfo():
+    """(total, used) in bytes, used = MemTotal - MemAvailable; None if unreadable."""
+    m = _kv(_read(MEMINFO_FILE), 1024)
+    if not m.get("MemTotal") or "MemAvailable" not in m:
+        return None
+    return m["MemTotal"], max(0, m["MemTotal"] - m["MemAvailable"])
+
+
+def read_psi_total():
+    """Microseconds that some process spent waiting on memory, since boot; None without PSI."""
+    m = re.search(r"^some .*total=(\d+)", _read(PSI_MEM_FILE) or "", re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
+def cgroup_memory_dir(cgroup_text):
+    """The memory cgroup folder for a process, from /proc/<pid>/cgroup (v1 or v2, any driver)."""
+    v1 = v2 = None
+    for line in (cgroup_text or "").splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if "memory" in parts[1].split(","):
+            v1 = os.path.join(CGROUP_ROOT, "memory", parts[2].lstrip("/"))
+        elif parts[0] == "0" and parts[1] == "":
+            v2 = os.path.join(CGROUP_ROOT, parts[2].lstrip("/"))
+    if v1 and os.path.exists(os.path.join(v1, "memory.usage_in_bytes")):
+        return v1
+    if v2 and os.path.exists(os.path.join(v2, "memory.current")):
+        return v2
+    return None
+
+
+def read_container_memory(cdir):
+    """{'required', 'cache', 'shown', 'oom'} in bytes for one container's cgroup; None if gone."""
+    st = _kv(_read(os.path.join(cdir, "memory.stat")))
+    if not st:
+        return None
+    cur = _read(os.path.join(cdir, "memory.current"))
+    if cur is not None:   # cgroup v2
+        kernel = st.get("kernel", st.get("slab", 0) + st.get("kernel_stack", 0)
+                        + st.get("pagetables", 0) + st.get("percpu", 0))
+        required = st.get("anon", 0) + kernel + st.get("sock", 0)
+        cache, inactive = st.get("file", 0), st.get("inactive_file", 0)
+        oom = _kv(_read(os.path.join(cdir, "memory.events"))).get("oom_kill", 0)
+    else:                 # cgroup v1
+        cur = _read(os.path.join(cdir, "memory.usage_in_bytes"))
+        if cur is None:
+            return None
+        kmem = to_int((_read(os.path.join(cdir, "memory.kmem.usage_in_bytes")) or "0").strip())
+        required = st.get("total_rss", st.get("rss", 0)) + kmem
+        cache = st.get("total_cache", st.get("cache", 0))
+        inactive = st.get("total_inactive_file", st.get("inactive_file", 0))
+        oom = _kv(_read(os.path.join(cdir, "memory.oom_control"))).get("oom_kill", 0)
+    usage = to_int(cur.strip())
+    return {"required": required, "cache": cache, "shown": max(0, usage - inactive), "oom": oom}
+
+
+def qbit_processes():
+    """{container id: (pid, memory cgroup folder)} for every running qbittorrent-nox in Docker."""
+    found = {}
+    try:
+        pids = [p for p in os.listdir(PROC_DIR) if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        if (_read(os.path.join(PROC_DIR, pid, "comm")) or "").strip() != "qbittorrent-nox":
+            continue
+        text = _read(os.path.join(PROC_DIR, pid, "cgroup")) or ""
+        m = re.search(r"[0-9a-f]{64}", text)
+        cdir = cgroup_memory_dir(text)
+        if m and cdir and m.group(0) not in found:
+            found[m.group(0)] = (pid, cdir)
+    return found
+
+
+def _open_files(pid):
+    """Paths (as the container sees them) of the files a process has open."""
+    fd_dir = os.path.join(PROC_DIR, pid, "fd")
+    out = []
+    try:
+        for fd in os.listdir(fd_dir):
+            try:
+                t = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if t.startswith("/"):
+                out.append(t)
+    except OSError:
+        pass
+    return out
+
+
+def _resume_stores(pid, files):
+    """torrents.db files and BT_backup folders for one qBittorrent, as host paths.
+    qBittorrent keeps torrents.db (SQLite storage) open, so that is checked first; its log file
+    sits next to BT_backup. Otherwise /config is searched a few levels deep."""
+    root = os.path.join(PROC_DIR, pid, "root")
+    dbs, backups = set(), set()
+    for f in files:
+        if f.endswith("/torrents.db"):
+            dbs.add(root + f)
+        elif "/logs/" in f and f.endswith(".log"):
+            backups.add(root + f.split("/logs/")[0] + "/BT_backup")
+    if not dbs:
+        base = os.path.join(root, "config")
+        for d, dirs, names in os.walk(base):
+            depth = d[len(base):].count("/")
+            if "torrents.db" in names:
+                dbs.add(os.path.join(d, "torrents.db"))
+            if "BT_backup" in dirs:
+                backups.add(os.path.join(d, "BT_backup"))
+            dirs[:] = [x for x in dirs if x != "BT_backup" and not x.startswith(".")] if depth < 3 else []
+    return dbs, {b for b in backups if os.path.isdir(b)}
+
+
+def _resume_hits(dbs, backups, hashes):
+    """(how many of the hashes this qBittorrent holds, how it was found)."""
+    best = (0, "")
+    for db in dbs:
+        try:
+            con = sqlite3.connect(f"file:{urllib.parse.quote(db)}?mode=ro", uri=True, timeout=2)
+            try:
+                q = f"SELECT count(*) FROM torrents WHERE torrent_id IN ({','.join('?' * len(hashes))})"
+                n = con.execute(q, hashes).fetchone()[0]
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        best = max(best, (n, "torrents.db"))
+    for b in backups:
+        n = sum(os.path.exists(os.path.join(b, h + ".fastresume")) for h in hashes)
+        best = max(best, (n, "fastresume files"))
+    return best
+
+
+def _content_hits(files, content_paths):
+    """How many of an instance's torrents have a file open in this process (fallback match)."""
+    hit = set()
+    for f in files:
+        p = f
+        for _ in range(12):
+            if p in content_paths:
+                hit.add(p)
+                break
+            p = p.rsplit("/", 1)[0]
+            if not p:
+                break
+    return len(hit)
+
+
+def match_containers():
+    """Works out which Docker container runs each qBittorrent instance, with no setting needed:
+    the instance's torrent hashes are looked up in each container's resume data. Saved in state;
+    redone only when a container is recreated or a match is still missing."""
+    _MATCH_TRIED["at"] = time.time()
+    procs = qbit_processes()
+    ctr = ST.setdefault("qbit_containers", {})
+    taken = {m["cid"] for lb, m in ctr.items() if m.get("cid") in procs and os.path.isdir(m.get("dir", ""))}
+    todo = [i for i in INSTANCES if not (ctr.get(i["label"], {}).get("cid") in procs
+                                         and os.path.isdir(ctr[i["label"]].get("dir", "")))
+            and QB.get(i["label"], {}).get("torrents")]
+    cands = [c for c in procs if c not in taken]
+    if not todo or not cands:
+        return
+    files = {c: _open_files(procs[c][0]) for c in cands}
+    stores = {c: _resume_stores(procs[c][0], files[c]) for c in cands}
+    scores = []
+    for inst in todo:
+        torrents = QB[inst["label"]]["torrents"]
+        hashes = sorted(torrents)[:25]
+        paths = {t.get("content_path") for t in torrents.values() if t.get("content_path")}
+        for c in cands:
+            n, how = _resume_hits(*stores[c], hashes)
+            if not n:
+                n, how = _content_hits(files[c], paths), "open files"
+            if n:
+                scores.append((n, inst["label"], c, how))
+    used_l, used_c = set(), set()
+    for n, label, c, how in sorted(scores, reverse=True):
+        if label in used_l or c in used_c:
+            continue
+        rivals = [s for s in scores if s[1] == label and s[2] != c and s[0] == n]
+        if rivals:
+            continue   # tie between containers - leave unmatched rather than guess
+        used_l.add(label)
+        used_c.add(c)
+        if c not in CID_NAME:
+            refresh_container_names()
+        name = CID_NAME.get(c, c[:12])
+        ctr[label] = {"cid": c, "dir": procs[c][1], "name": name}
+        _MATCH_WARNED.discard(label)
+        log(f"qBittorrent instance '{label}' is container '{name}' (matched by {how}).")
+    for inst in todo:
+        if inst["label"] not in used_l and inst["label"] not in _MATCH_WARNED:
+            _MATCH_WARNED.add(inst["label"])
+            log(f"qBittorrent instance '{inst['label']}': container not found - its RAM isn't reported. "
+                "Retrying every 15 min.")
+
+
+def ram_sample(elapsed_ms, over_any, disk_valid, array_util):
+    mi = read_meminfo()
+    psi = read_psi_total()
+    oom_sys = _kv(_read(VMSTAT_FILE)).get("oom_kill")
+    stall = sys_oom = 0
+    have_stall = psi is not None and _RAM_PREV.get("psi") is not None and psi >= _RAM_PREV["psi"]
+    if have_stall:
+        stall = psi - _RAM_PREV["psi"]
+    if oom_sys is not None and _RAM_PREV.get("oom") is not None and oom_sys > _RAM_PREV["oom"]:
+        sys_oom = oom_sys - _RAM_PREV["oom"]
+    _RAM_PREV.update(psi=psi, oom=oom_sys)
+
+    readings = {}
+    if QBIT_ENABLED and INSTANCES:
+        ctr = ST.setdefault("qbit_containers", {})
+        missing = gone = False
+        for inst in INSTANCES:
+            m = ctr.get(inst["label"])
+            r = read_container_memory(m["dir"]) if m and os.path.isdir(m.get("dir", "")) else None
+            if r:
+                readings[inst["label"]] = r
+            else:
+                missing = True
+                gone = gone or bool(m)   # matched container was recreated (e.g. image update)
+        if gone or (missing and time.time() - _MATCH_TRIED["at"] >= CONTAINER_MATCH_RETRY_SEC):
+            if gone:
+                for label in [lb for lb, m in ctr.items() if not os.path.isdir(m.get("dir", ""))]:
+                    del ctr[label]
+            match_containers()
+        prev_oom = ST.setdefault("qbit_oom_prev", {})
+        for label, r in readings.items():
+            cid = ctr[label]["cid"]
+            p = prev_oom.get(label)
+            killed = r["oom"] - p[1] if p and p[0] == cid and r["oom"] > p[1] else 0
+            prev_oom[label] = [cid, r["oom"]]
+            r["killed"] = killed
+            if killed:
+                oom_alert(label, r, mi)
+
+    thr = QBIT_RAM_THRESHOLD_GB * GIB
+    cache_mb = sum(r["cache"] for r in readings.values()) // 1048576
+    for w in wins():
+        if mi:
+            total, used = mi
+            w["RAM_SAMPLES"] += 1
+            w["RAM_USED_SUM"] += used
+            w["RAM_TOTAL"] = total
+            w["RAM_USED_PEAK"] = max(w["RAM_USED_PEAK"], used)
+            if used * 100 >= RAM_THRESHOLD * total:
+                w["RAM_OVER_SAMPLES"] += 1
+        if have_stall:
+            w["RAM_STALL_US"] += stall
+            w["RAM_STALL_MS"] += elapsed_ms
+        w["SYS_OOM"] += sys_oom
+        for label, r in readings.items():
+            add(w["QRAM_SAMPLES"], label, 1)
+            add(w["QRAM_REQ_SUM"], label, r["required"])
+            add(w["QRAM_CACHE_SUM"], label, r["cache"])
+            add(w["QRAM_SHOWN_SUM"], label, r["shown"])
+            w["QRAM_REQ_PEAK"][label] = max(w["QRAM_REQ_PEAK"].get(label, 0), r["required"])
+            if thr > 0 and r["required"] >= thr:
+                add(w["QRAM_OVER_SAMPLES"], label, 1)
+            if over_any:
+                add(w["QRAM_DOVER_CACHE_SUM"], label, r["cache"])
+                add(w["QRAM_DOVER_SAMPLES"], label, 1)
+            if r.get("killed"):
+                add(w["QRAM_OOM"], label, r["killed"])
+        if readings and disk_valid:
+            w["CCORR_N"] += 1
+            w["CCORR_SU"] += array_util
+            w["CCORR_SUU"] += array_util * array_util
+            w["CCORR_S"] += cache_mb
+            w["CCORR_SS"] += cache_mb * cache_mb
+            w["CCORR_SX"] += cache_mb * array_util
+
+
+def oom_alert(label, r, mi):
+    name = ST.get("qbit_containers", {}).get(label, {}).get("name", "?")
+    sysline = f"\nSystem RAM: {100 * mi[1] / mi[0]:.0f}% used." if mi else ""
+    log(f"Out-of-memory kill in qBittorrent instance '{label}' ({name}).")
+    if send_embed(f"🛑 qBittorrent Out of Memory — {HOST}",
+                  f"**{label}** ({name}): {r['killed']} process(es) killed for lack of memory.\n"
+                  f"Now: {fmt_gb(r['required'])} required + {fmt_gb(r['cache'])} cache.{sysline}", COLOR_ALERT):
+        ST["last_notify"] = NOW
+
+
 # ================================================================== Discord
 def _clip(s, n):
     s = s or ""
@@ -1200,16 +1533,24 @@ def stream_field(w):
     return [(title, "\n".join(lines) or "No streams on the array this period", False)]
 
 
-def corr_r(w, suffix):
-    """Pearson r between array util and a driver; None with fewer than 30 samples."""
-    n, su, suu = w["CORR_N"], w["CORR_SU"], w["CORR_SUU"]
-    sx, sxx, sxu = w[f"CORR_S_{suffix}"], w[f"CORR_SS_{suffix}"], w[f"CORR_SX_{suffix}"]
+def _pearson(n, su, suu, sx, sxx, sxu):
     if n < 30:
         return None
     d = (n * sxx - sx * sx) * (n * suu - su * su)
     if d <= 0:
         return None
     return round((n * sxu - sx * su) / d ** 0.5, 2)
+
+
+def corr_r(w, suffix):
+    """Pearson r between array util and a driver; None with fewer than 30 samples."""
+    return _pearson(w["CORR_N"], w["CORR_SU"], w["CORR_SUU"],
+                    w[f"CORR_S_{suffix}"], w[f"CORR_SS_{suffix}"], w[f"CORR_SX_{suffix}"])
+
+
+def corr_cache(w):
+    """Pearson r between array util and the qBittorrent containers' cache size."""
+    return _pearson(w["CCORR_N"], w["CCORR_SU"], w["CCORR_SUU"], w["CCORR_S"], w["CCORR_SS"], w["CCORR_SX"])
 
 
 def corr_field(w):
@@ -1219,9 +1560,75 @@ def corr_field(w):
     if ra is None:
         return []
     f = lambda v: "-" if v is None else f"{v:.2f}"
+    rc = corr_cache(w) if RAM_ENABLED else None
+    cache = f" • qBit cache {f(rc)}" if rc is not None else ""
     return [("🔗 What moves with array load (r)",
-             f"Active uploads {f(ra)} • Peers {f(rp)} • Upload speed {f(rs)}\n"
+             f"Active uploads {f(ra)} • Peers {f(rp)} • Upload speed {f(rs)}{cache}\n"
              "Scale -1 to 1: nearer 1 = rises and falls with disk load", False)]
+
+
+def ram_field(w, detail):
+    """System RAM and, per qBittorrent instance, required memory vs. releasable cache."""
+    if not RAM_ENABLED:
+        return []
+    n = w["RAM_SAMPLES"]
+    if not n:
+        return [("🧠 RAM", "no data this period", False)]
+    total = w["RAM_TOTAL"] or 1
+    used = w["RAM_USED_SUM"] / n
+    line = (f"System: avg {100 * used / total:.0f}% used ({fmt_gb(used)} of {fmt_gb(total)}) • "
+            f"peak {100 * w['RAM_USED_PEAK'] / total:.0f}%")
+    if w["RAM_OVER_SAMPLES"]:
+        line += f" • ≥{RAM_THRESHOLD}% {pct(w['RAM_OVER_SAMPLES'], n)}% of time"
+    if w["RAM_STALL_MS"]:
+        stall = w["RAM_STALL_US"] / (w["RAM_STALL_MS"] * 10)
+        if stall >= 0.1:
+            line += f" • waiting on RAM {stall:.1f}% of time"
+    lines = [line]
+    if w["SYS_OOM"]:
+        lines.append(f"🛑 {w['SYS_OOM']} out-of-memory kill(s) on the system")
+    if QBIT_ENABLED:
+        ctr = ST.get("qbit_containers", {})
+        for inst in INSTANCES:
+            lb = inst["label"]
+            c = w["QRAM_SAMPLES"].get(lb, 0)
+            if not c:
+                lines.append(f"{lb}: container not found")
+                continue
+            name = ctr.get(lb, {}).get("name", "?")
+            lines.append(f"{lb} ({name}): {fmt_gb(w['QRAM_REQ_SUM'][lb] / c)} required + "
+                         f"{fmt_gb(w['QRAM_CACHE_SUM'].get(lb, 0) / c)} cache • Unraid shows "
+                         f"{fmt_gb(w['QRAM_SHOWN_SUM'].get(lb, 0) / c)}")
+            extra = []
+            if detail:
+                extra.append(f"peak required {fmt_gb(w['QRAM_REQ_PEAK'].get(lb, 0))}")
+                dn = w["QRAM_DOVER_SAMPLES"].get(lb, 0)
+                if dn:
+                    extra.append(f"cache during ≥{THRESHOLD}% I/O {fmt_gb(w['QRAM_DOVER_CACHE_SUM'].get(lb, 0) / dn)}")
+            if QBIT_RAM_THRESHOLD_GB > 0 and w["QRAM_OVER_SAMPLES"].get(lb, 0):
+                extra.append(f"≥{QBIT_RAM_THRESHOLD_GB:g} GB required {pct(w['QRAM_OVER_SAMPLES'][lb], c)}% of time")
+            if w["QRAM_OOM"].get(lb, 0):
+                extra.append(f"🛑 {w['QRAM_OOM'][lb]} OOM kill(s)")
+            if extra:
+                lines.append("↳ " + " • ".join(extra))
+    return [("🧠 RAM", "\n".join(lines), False)]
+
+
+def ram_alert_reasons(w):
+    """Why this interval's RAM use deserves an alert (average-based); empty if it doesn't."""
+    if not RAM_ENABLED:
+        return []
+    out = []
+    n = w["RAM_SAMPLES"]
+    if n and w["RAM_TOTAL"] and 100 * w["RAM_USED_SUM"] / n / w["RAM_TOTAL"] >= RAM_THRESHOLD:
+        out.append(f"system RAM averaged {100 * w['RAM_USED_SUM'] / n / w['RAM_TOTAL']:.0f}% used")
+    if QBIT_ENABLED and QBIT_RAM_THRESHOLD_GB > 0:
+        for inst in INSTANCES:
+            lb = inst["label"]
+            c = w["QRAM_SAMPLES"].get(lb, 0)
+            if c and w["QRAM_REQ_SUM"].get(lb, 0) / c >= QBIT_RAM_THRESHOLD_GB * GIB:
+                out.append(f"{lb} averaged {fmt_gb(w['QRAM_REQ_SUM'][lb] / c)} required")
+    return out
 
 
 def post_tracker_message(w, label):
@@ -1257,16 +1664,25 @@ def interval_report():
     w = ST["windows"]["interval"]
     elapsed_min = (NOW - w["START"] + 30) // 60
     fields, triggered = disk_fields(w, "interval")
-    fields += qbit_compact_field(w)
+    fields += qbit_compact_field(w) + ram_field(w, False)
+    ram_reasons = ram_alert_reasons(w)
     footer = footer_text("interval", w)
     snap = (f" Stream snapshots: {STREAM_TRIES - STREAM_FAILS}/{STREAM_TRIES} ok, "
             f"{w['STREAM_OVER_SAMPLES']} during >={THRESHOLD}%." if STREAMS_ENABLED else "")
-    log(f"Interval window compiled ({elapsed_min} min). Aggregate avg: {agg_avg(w)}%. Triggered: {int(triggered)}.{snap}")
+    log(f"Interval window compiled ({elapsed_min} min). Aggregate avg: {agg_avg(w)}%. Triggered: {int(triggered)}."
+        f"{' RAM: ' + '; '.join(ram_reasons) + '.' if ram_reasons else ''}{snap}")
     STREAM_TRIES = STREAM_FAILS = 0
     hours = (NOW - ST["last_notify"]) / 3600
-    if triggered:
-        if send_embed(f"⚠️ Disk I/O Alert — {HOST}",
-                      f"One or more disks hit {THRESHOLD}%+ in the last {elapsed_min} min.", COLOR_ALERT, fields, footer):
+    if triggered or ram_reasons:
+        kind = " + ".join(k for k, on in (("Disk I/O", triggered), ("RAM", ram_reasons)) if on)
+        desc = []
+        if triggered:
+            desc.append(f"One or more disks hit {THRESHOLD}%+ in the last {elapsed_min} min.")
+        if ram_reasons:
+            limits = f"{RAM_THRESHOLD}% system" + (f", {QBIT_RAM_THRESHOLD_GB:g} GB per qBittorrent"
+                                                   if QBIT_RAM_THRESHOLD_GB > 0 else "")
+            desc.append(f"RAM over threshold ({limits}): " + "; ".join(ram_reasons) + ".")
+        if send_embed(f"⚠️ {kind} Alert — {HOST}", "\n".join(desc), COLOR_ALERT, fields, footer):
             log("Sent threshold alert.")
             ST["last_notify"] = NOW
     elif HEALTH_PING_HOURS > 0 and hours >= HEALTH_PING_HOURS:
@@ -1279,7 +1695,7 @@ def interval_report():
 def summary_report(window_name, title, color, with_corr=False, note=""):
     w = ST["windows"][window_name]
     fields, _ = disk_fields(w, "summary")
-    fields += qbit_detail_fields(w) + upload_field(w) + tier_field(w) + stream_field(w)
+    fields += qbit_detail_fields(w) + upload_field(w) + tier_field(w) + stream_field(w) + ram_field(w, True)
     if with_corr:
         fields += corr_field(w)
     log(f"{title} compiled.")
@@ -1368,6 +1784,13 @@ def test_record(w, name, start, end):
     rec["disks"] = disks
     rec["tiers"] = {t: round(100 * b / tb, 1) for t, b in w["TIER_BYTES"].items()} if tb else {}
     rec.update({"r_active": corr_r(w, "ACT"), "r_peers": corr_r(w, "PEER"), "r_speed": corr_r(w, "SPD")})
+    if w["RAM_SAMPLES"] and w["RAM_TOTAL"]:
+        rec["ram_pct"] = round(100 * w["RAM_USED_SUM"] / w["RAM_SAMPLES"] / w["RAM_TOTAL"], 1)
+    labels = [lb for lb, c in w["QRAM_SAMPLES"].items() if c]
+    if labels:
+        rec["qbit_req_gb"] = r2(sum(w["QRAM_REQ_SUM"][lb] / w["QRAM_SAMPLES"][lb] for lb in labels) / GIB)
+        rec["qbit_cache_gb"] = r2(sum(w["QRAM_CACHE_SUM"].get(lb, 0) / w["QRAM_SAMPLES"][lb] for lb in labels) / GIB)
+        rec["r_cache"] = corr_cache(w)
     return rec
 
 
@@ -1426,6 +1849,11 @@ def comparison_table(recs):
     for tk in sorted((t[-1].get("tiers") or {}), key=lambda k: (k == "none", natural_key(k))):
         label = ("No tier" if tk == "none" else f"Tier {tk}") + " share %"
         row(label, "%.0f", lambda r, tk=tk: (r.get("tiers") or {}).get(tk))
+    if any("ram_pct" in r or "qbit_req_gb" in r for r in t):
+        section("RAM")
+        row("System used %", "%.0f", lambda r: r.get("ram_pct"))
+        row("qBit required GB", "%.1f", lambda r: r.get("qbit_req_gb"))
+        row("qBit cache GB", "%.1f", lambda r: r.get("qbit_cache_gb"))
     section("NORMALIZED (lower = better)")
     row("Min/d per 10 act", "%.2f", lambda r: r.get("min_per_10_active"))
     row("Min/d /100 arr GB", "%.2f", lambda r: r.get("min_per_100gb"))
@@ -1433,6 +1861,8 @@ def comparison_table(recs):
     row("Active uploads", "%.2f", lambda r: r.get("r_active"))
     row("Peers", "%.2f", lambda r: r.get("r_peers"))
     row("Upload speed", "%.2f", lambda r: r.get("r_speed"))
+    if any("r_cache" in r for r in t):
+        row("qBit cache", "%.2f", lambda r: r.get("r_cache"))
     return "\n".join(lines)
 
 
@@ -1643,6 +2073,11 @@ def run():
             ok = bool(qbit_fetch(f"{inst['url']}/api/v2/app/version"))
             log(f"qBittorrent instance '{inst['label']}' "
                 + ("reachable via Qui proxy." if ok else f"NOT reachable at {inst['url']} - check QUI_CONTAINER_NAME/proxy key."))
+    if RAM_ENABLED:
+        mi = read_meminfo()
+        log(f"RAM monitoring enabled: {fmt_gb(mi[0])} total, alert at {RAM_THRESHOLD}% average"
+            + (f" or {QBIT_RAM_THRESHOLD_GB:g} GB required per qBittorrent." if QBIT_RAM_THRESHOLD_GB > 0 else ".")
+            if mi else "RAM monitoring: /proc/meminfo unreadable - system RAM not reported.")
     if STREAMS_ENABLED:
         if shutil.which("lsof"):
             refresh_container_names()
@@ -1704,6 +2139,8 @@ def run():
                 acc_streams(w, over_any, over_devs)
         if QBIT_ENABLED:
             acc_qbit(over_any, disk_valid, array_util)
+        if RAM_ENABLED:
+            ram_sample(elapsed, over_any, disk_valid, array_util)
 
         NOW = int(time.time())
         ST["last_sample_ts"] = NOW

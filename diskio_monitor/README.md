@@ -1,6 +1,6 @@
 # Unraid Disk I/O Monitor → Discord
 
-A User Scripts add-on for Unraid that watches how busy each array disk is, works out **what** is keeping it busy, and reports to Discord. It was built to answer one question: *why do my array disks keep hitting 100%, and do my seeding settings actually change that?*
+A User Scripts add-on for Unraid that watches how busy each array disk is, works out **what** is keeping it busy, and reports to Discord. It also tracks RAM, including how much of each qBittorrent's memory it actually needs and how much is releasable cache. It was built to answer one question: *why do my array disks keep hitting 100%, and do my seeding settings actually change that?*
 
 It measures per-disk utilization every 30 seconds with no gaps, ties disk spikes to the containers and torrents active at the time, and adds a test mode so you can change a setting, run it for a week, and get a side-by-side comparison against previous tests.
 
@@ -8,12 +8,13 @@ It measures per-disk utilization every 30 seconds with no gaps, ties disk spikes
 
 | Report | When | Contents |
 |---|---|---|
-| ⚠️ **Disk I/O alert** | Every interval (default 4 h), only if a disk crossed the threshold | Each disk's average utilization and share of time over the threshold, plus qBittorrent upload speed and active uploads |
+| ⚠️ **Disk I/O / RAM alert** | Every interval (default 4 h), only if a disk crossed the threshold or average RAM use crossed its threshold | Each disk's average utilization and share of time over the threshold, qBittorrent upload speed and active uploads, and RAM |
+| 🛑 **qBittorrent out of memory** | Immediately | A qBittorrent process was killed for lack of memory, with its memory at the time |
 | ✅ **Still monitoring** | After a quiet stretch (default 12 h) | Same layout, as a heartbeat |
-| 📊 **Daily summary** | Midnight | Per-disk load, with the containers that had files open on each hot disk · qBittorrent overall vs. during spikes · GB uploaded (array vs. pool, fresh vs. old torrents, new torrents) · upload by tier · array streams by container · 🔔 reminder when a newer version is on GitHub |
+| 📊 **Daily summary** | Midnight | Per-disk load, with the containers that had files open on each hot disk · qBittorrent overall vs. during spikes · GB uploaded (array vs. pool, fresh vs. old torrents, new torrents) · upload by tier · array streams by container · RAM: system and per qBittorrent, required vs. cache · 🔔 reminder when a newer version is on GitHub |
 | 📡 **Tracker breakdown** | After each daily and rollup report | Every tracker grouped by tier: active uploads, GB uploaded, average speed, time at upload cap |
-| 🗓️ **Rollup** | Every 7 days (configurable) | Daily summary over the whole period, plus which factor moves with disk load (active uploads, peers, or upload speed) |
-| 🧪 **Test comparison** | When a test ends, with each rollup, or on demand | Up to several tests side by side: disk load, demand, upload, normalized load, tier shares |
+| 🗓️ **Rollup** | Every 7 days (configurable) | Daily summary over the whole period, plus which factor moves with disk load (active uploads, peers, upload speed, or qBittorrent's cache size) |
+| 🧪 **Test comparison** | When a test ends, with each rollup, or on demand | Up to several tests side by side: disk load, demand, upload, RAM, normalized load, tier shares |
 
 Reports are Discord embeds, so they read cleanly on desktop and mobile.
 
@@ -27,6 +28,7 @@ Reports are Discord embeds, so they read cleanly on desktop and mobile.
 - **Tiers.** If you tag torrents by tier (e.g. with qui automations), reports show each tier's share of upload, the split above and below a ratio target, and how often capped torrents sit at their limit.
 - **Test mode with normalization.** Each test is saved with per-day figures, demand indicators (swarm leechers, new torrents) and efficiency ratios (disk minutes over threshold per 10 active uploads, and per 100 GB uploaded from the array). Comparisons flag when demand differed enough between tests that raw totals aren't comparable.
 - **Robust state.** Totals and the report schedule survive restarts, edits, and reboots. Offline time is flagged in reports instead of silently skewing them.
+- **RAM.** System RAM use, plus each qBittorrent container's memory split into *required* (qBittorrent's own memory and peer buffers) and *cache* (torrent data held in RAM, which Linux frees when something else needs it). Containers are matched to your qui instances automatically, with no container names to configure. Reports show cache size during disk spikes, and rollups show whether cache size moves with disk load: when cache gets squeezed, seeding turns into disk reads.
 - **Update reminders.** Once a day the script checks GitHub for a newer version, and while one is available the daily summary starts with a 🔔 reminder linking to what's new and the update steps. If the update changes how results are measured, the reminder warns you so you can finish the current test first. Nothing is downloaded or changed for you.
 - **Privacy.** Tracker passkeys are stripped the moment data arrives and are never stored or sent.
 
@@ -143,6 +145,9 @@ All settings live in the user script.
 | `STREAM_SHARES` | `data` | User shares to attribute streams for (only the array portion is counted) |
 | `STREAM_TOP_N` | `8` | Containers listed in the streams field |
 | `STREAM_LSOF_TIMEOUT` | `20` | Skip a stream snapshot if `lsof` takes longer |
+| `RAM_ENABLED` | `true` | RAM reporting on or off |
+| `RAM_THRESHOLD_PERCENT` | `90` | Interval alert when average system RAM use is at least this |
+| `QBIT_RAM_THRESHOLD_GB` | `0` (off) | Interval alert when a qBittorrent's average *required* RAM is at least this many GB |
 | `UPDATE_CHECK` | `true` | Daily check for a newer version on GitHub, shown as a reminder in the daily summary (see [Updating](#updating)) |
 | `LOG_FILE` | `/var/log/diskio_monitor.log` | Log location (rotated daily or at 10 MB) |
 
@@ -171,6 +176,8 @@ This is read-only and safe while the monitor is running.
 - **At cap.** Of the time capped torrents were uploading, how much was spent at 90% or more of their limit.
 - **What moves with array load (r).** A correlation from -1 to 1 between array utilization and each candidate driver. Nearer 1 means it rises and falls with disk load. Shown once there are at least 30 samples.
 - **Normalized rows (comparisons).** Disk load relative to workload, so a quiet week doesn't look like an improvement. Lower is better. If swarm demand changed by more than 25% between tests, the comparison says so.
+- **🧠 RAM.** *System* is RAM in use (total minus available) and how often it was over `RAM_THRESHOLD_PERCENT`. *Waiting on RAM* appears when processes actually stalled for memory, a better sign of a real shortage than a high percentage. For each qBittorrent: *required* is memory it needs and can't give back; *cache* is torrent data held in RAM, released whenever something else needs it; *Unraid shows* is the figure on the Docker page, which counts required memory plus recently used cache. The per-instance threshold uses *required*, because cache filling free RAM is normal.
+- **Cache during ≥ threshold.** qBittorrent's cache while a disk was over the threshold. If it's much lower than the overall cache, disk spikes may come from cache being squeezed out of RAM rather than from seeding demand.
 - **Footer flags.** 🚚 time excluded for mover, ⚠️ time the monitor was offline (unsampled), and 🧪 the current test and day.
 
 ## Files
@@ -220,10 +227,13 @@ The bash version was a single script in User Scripts and doesn't use `diskio_mon
 | `Stream snapshot skipped: lsof exceeded 20s` | Raise `STREAM_LSOF_TIMEOUT`, or set `STREAMS_ENABLED=false` |
 | `Could not read Qui tracker customizations` | Check `QUI_API_KEY`, or leave it blank |
 | `Update check failed: …` | GitHub couldn't be reached; the reminder is skipped that day. Set `UPDATE_CHECK=false` to stop checking |
+| `qBittorrent instance '…': container not found` | The script couldn't match that instance to a container: is qBittorrent running in Docker? It retries every 15 minutes; disk and upload reports aren't affected |
 | `No physical disks found` | Check `MONITOR_NAME_REGEX`; the array must be started |
 
 ## Notes and limitations
 
 - The script runs as a background process. Measuring costs a single read of `/proc/diskstats` per sample, which never touches the disks; the `lsof` pass runs at the lowest CPU and I/O priority.
 - Array vs. pool detection checks only pool paths, so it never wakes array disks. It assumes your shares follow the standard Unraid layout (`/mnt/<pool>/<share>/…`).
+- **How containers are matched.** The script finds running `qbittorrent-nox` processes, then looks for each instance's torrent hashes in that container's resume data: `torrents.db` with SQLite storage, or `BT_backup/*.fastresume` files with the default storage. It works with hotio, linuxserver and binhex images and any container names or networking. If neither is found, it falls back to the files each qBittorrent has open. The match is saved and redone when a container is recreated. With appdata on the array instead of a cache pool, this lookup could spin up that disk once at startup.
+- **RAM costs nothing extra on disk.** It reads `/proc/meminfo` and each container's memory files under `/sys/fs/cgroup`, which live in RAM. Containers that run other processes alongside qBittorrent (e.g. binhex VPN images) include those in their figures.
 - qBittorrent's API reports which tracker URL a torrent is currently using. If a torrent fails over between two URLs that resolve to different names, its upload is split between them unless they're merged with an alias or in qui.
