@@ -70,6 +70,13 @@ STREAM_SHARES=("data")     # user shares to attribute streams for
 STREAM_TOP_N=8             # max containers listed in the streams field
 STREAM_LSOF_TIMEOUT=20     # seconds; that sample's stream snapshot is skipped if lsof takes longer
 
+# RAM: system use, and for each qBittorrent container how much is required vs. releasable cache.
+# Containers are found automatically (no names needed). An interval alert is sent when average
+# use crosses a threshold; a qBittorrent process killed for lack of memory is reported at once.
+RAM_ENABLED=true
+RAM_THRESHOLD_PERCENT=90    # alert when average system RAM use over an interval is at least this
+QBIT_RAM_THRESHOLD_GB=0     # alert when a qBittorrent's average *required* RAM is at least this (e.g. 4); 0 = off
+
 # Once a day, check GitHub for a newer diskio_monitor.py and add a reminder to the daily summary.
 UPDATE_CHECK=true
 
