@@ -2,6 +2,10 @@
 
 Changes to `diskio_monitor`. Releases marked **⚠️ Measurement change** change how test figures are measured or calculated; updating in the middle of a test mixes old and new numbers, so it's best to update when you start the next test. See [Updating](README.md#updating).
 
+## 2.2.1
+
+- Fix: stopping the array could hang on `umount: /mnt/user: target is busy` because the monitor kept running. It now stops itself (saving state) as soon as the array starts stopping, which also ends the User Scripts wrapper, and starts again with the array.
+
 ## 2.2.0
 
 - RAM monitoring: system RAM use, and each qBittorrent container's memory split into required vs. releasable cache, in every report and in test comparisons. Rollups show whether qBittorrent's cache size moves with disk load.
