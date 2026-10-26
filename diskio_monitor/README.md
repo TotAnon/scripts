@@ -232,6 +232,7 @@ The bash version was a single script in User Scripts and doesn't use `diskio_mon
 
 ## Notes and limitations
 
+- **Stopping the array.** The monitor watches the array state and stops itself as soon as the array starts stopping, saving its state first, so neither it nor the User Scripts wrapper keeps `/mnt/user` busy and the array unmounts cleanly. With the **At Startup of Array** schedule it starts again with the array; the time in between shows as offline in reports.
 - The script runs as a background process. Measuring costs a single read of `/proc/diskstats` per sample, which never touches the disks; the `lsof` pass runs at the lowest CPU and I/O priority.
 - Array vs. pool detection checks only pool paths, so it never wakes array disks. It assumes your shares follow the standard Unraid layout (`/mnt/<pool>/<share>/…`).
 - **How containers are matched.** The script finds running `qbittorrent-nox` processes, then looks for each instance's torrent hashes in that container's resume data: `torrents.db` with SQLite storage, or `BT_backup/*.fastresume` files with the default storage. It works with hotio, linuxserver and binhex images and any container names or networking. If neither is found, it falls back to the files each qBittorrent has open. The match is saved and redone when a container is recreated. With appdata on the array instead of a cache pool, this lookup could spin up that disk once at startup.

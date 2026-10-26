@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 if sys.version_info < (3, 8):
     sys.exit("diskio_monitor needs Python 3.8 or newer")
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 # Bump with any release that changes how test results are measured or calculated, so the
 # update reminder can warn that updating mid-test mixes old and new numbers.
 MEASUREMENT_VERSION = 2
@@ -126,6 +126,7 @@ for _e in _list("QBIT_INSTANCES", []):
 DISKSTATS_FILE = _env("DIM_DISKSTATS", "/proc/diskstats")
 SYS_BLOCK_DIR = _env("DIM_SYS_BLOCK", "/sys/block")
 DISKS_INI = _env("DIM_DISKS_INI", "/var/local/emhttp/disks.ini")
+VAR_INI = _env("DIM_VAR_INI", "/var/local/emhttp/var.ini")
 PROC_DIR = _env("DIM_PROC", "/proc")
 MNT_ROOT = _env("DIM_MNT", "/mnt")
 WORK_DIR = _env("DIM_WORK", "/tmp/diskio_monitor")
@@ -1907,6 +1908,42 @@ class Stop(Exception):
     pass
 
 
+_ARRAY = {"started": False, "mounted": False, "save": True}
+
+
+def array_stopping():
+    """Why the monitor should stop for the array, or ''. Only a change after the array was seen
+    started counts, so a monitor launched while the array is still starting keeps running."""
+    m = re.search(r'^fsState="([^"]*)"', _read(VAR_INI) or "", re.MULTILINE)
+    if m:
+        if m.group(1) == "Started":
+            _ARRAY["started"] = True
+        elif _ARRAY["started"]:
+            return f"array state {m.group(1)}"
+    if os.path.ismount(os.path.join(MNT_ROOT, "user")):
+        _ARRAY["mounted"] = True
+    elif _ARRAY["mounted"]:
+        _ARRAY["save"] = False   # STATE_DIR is gone; saving now would write into RAM under /mnt/user
+        return "/mnt/user unmounted"
+    return ""
+
+
+def wait(seconds):
+    """Sleeps, checking every 2s whether the array is stopping. If it is, stops the monitor (state is
+    saved) so this process and the User Scripts wrapper don't keep /mnt/user busy."""
+    end = time.monotonic() + seconds
+    while True:
+        why = array_stopping()
+        if why:
+            log(f"Array stopping ({why}) - stopping the monitor so the array can unmount. "
+                "It starts again with the array.")
+            raise Stop()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(2, left))
+
+
 def _on_signal(signum, frame):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2001,6 +2038,7 @@ def main():
         return compare_main()
 
     die_with_parent()
+    os.chdir("/")   # never hold /mnt/user busy through the working directory
     take_lock()
     startup_common()
     if not DEVICES:
@@ -2055,8 +2093,11 @@ def main():
     except Stop:
         pass
     finally:
-        save_state()
-        log("Stopped - state saved.")
+        if _ARRAY["save"]:
+            save_state()
+            log("Stopped - state saved.")
+        else:
+            log("Stopped - state not saved (array already unmounted); it resumes from the last save.")
         release_lock()
     return 0
 
@@ -2090,11 +2131,11 @@ def run():
     half = SAMPLE_SECONDS // 2
     while True:
         mover = mover_running()
-        time.sleep(half)
+        wait(half)
         if QBIT_ENABLED:
             qbit_collect()
         snap_ok = STREAMS_ENABLED and not mover and stream_snapshot()
-        time.sleep(SAMPLE_SECONDS - half)
+        wait(SAMPLE_SECONDS - half)
 
         cur, cur_ms = snapshot(), mono_ms()
         elapsed = cur_ms - prev_ms
