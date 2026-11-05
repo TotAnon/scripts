@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -555,6 +555,36 @@ class QBitProxyClient:
         except Exception as e:
             log(f"[Proxy] Error re-pinning torrent {h} to bottom of queue: {e}")
 
+    def ensure_category(self, torrent_hash: str, category: str, verify_attempts: int = 3, verify_delay: float = 1.0) -> bool:
+        """Makes sure the torrent is in `category`, setting it directly if
+        not, then verifying via a live read (same lag-tolerant retry as
+        pause/resume). Returns True if confirmed in the right category."""
+        h = torrent_hash.lower()
+        live = self.get_live_torrent(h)
+        if live is not None and live.get("category") == category:
+            return True
+
+        try:
+            r = self.session.post(f"{self.base_url}/api/v2/torrents/setCategory",
+                                  data={"hashes": h, "category": category}, timeout=5)
+            if r.status_code == 409:
+                log(f"[Proxy] setCategory for {h} rejected: category '{category}' doesn't exist in this qBittorrent instance.")
+                return False
+        except Exception as e:
+            log(f"[Proxy] Error setting category '{category}' on {h}: {e}")
+            return False
+
+        for attempt in range(verify_attempts):
+            live = self.get_live_torrent(h)
+            if live is not None and live.get("category") == category:
+                return True
+            if attempt < verify_attempts - 1:
+                time.sleep(verify_delay)
+
+        current = live.get("category") if live else "unknown"
+        log(f"[Proxy] Category on {h} is still '{current}' after trying to set '{category}'.")
+        return False
+
     def _get_torrent_state(self, h: str) -> Tuple[bool, Optional[str]]:
         """Returns (found, state). Raises on connection failure so callers
         can tell 'qBit unreachable' apart from 'torrent genuinely gone'."""
@@ -649,18 +679,72 @@ def any_active_download(proxy_clients: List["QBitProxyClient"]) -> bool:
 # Arr API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_arr_queue(base_url: str, api_key: str) -> List[Dict[str, Any]]:
+def get_arr_queue(base_url: str, api_key: str, page_size: int = 250) -> List[Dict[str, Any]]:
+    """Fetches the ENTIRE queue, page by page. Only reading the first page
+    meant a paused loser (or its winner) could sit on page 2+ and be
+    invisible - so at resume time its Arr record 'didn't exist', the Arr
+    changeCategory call was skipped, and the category never changed."""
+    records: List[Dict[str, Any]] = []
+    page = 1
+    try:
+        while True:
+            res = requests.get(
+                f"{base_url.rstrip('/')}/api/v3/queue",
+                headers={"X-Api-Key": api_key},
+                params={"includeUnknownSeriesItems": "true", "pageSize": page_size, "page": page},
+                timeout=15
+            )
+            res.raise_for_status()
+            data = res.json()
+            batch = data.get("records", [])
+            records.extend(batch)
+            total = data.get("totalRecords", len(records))
+            if not batch or len(records) >= total:
+                break
+            page += 1
+        return records
+    except Exception as e:
+        log(f"[Arr API] Error fetching queue from {base_url} (page {page}): {e}")
+        return records
+
+
+def get_post_import_categories(base_url: str, api_key: str, app_type: str) -> Dict[str, str]:
+    """Each download client's configured Post-Import Category, read straight
+    from Arr (Settings > Download Clients), keyed by client name. Used to
+    VERIFY the category actually changed after resume, and to set it
+    directly if Arr's changeCategory didn't take. Clients with no
+    post-import category are simply absent - nothing is enforced for them,
+    so this is a no-op for setups that don't use one."""
+    field_name = "tvImportedCategory" if app_type == "Sonarr" else "movieImportedCategory"
     try:
         res = requests.get(
-            f"{base_url.rstrip('/')}/api/v3/queue",
+            f"{base_url.rstrip('/')}/api/v3/downloadclient",
             headers={"X-Api-Key": api_key},
-            params={"includeUnknownSeriesItems": "true", "pageSize": 100},
             timeout=10
         )
-        return res.json().get("records", [])
+        res.raise_for_status()
+        result: Dict[str, str] = {}
+        for client in res.json():
+            for f in client.get("fields", []):
+                if f.get("name") == field_name and f.get("value"):
+                    result[client.get("name", "")] = str(f["value"]).strip()
+        return result
     except Exception as e:
-        log(f"[Arr API] Error fetching queue from {base_url}: {e}")
-        return []
+        log(f"[Arr API] Could not read download client config from {base_url}: {e}")
+        return {}
+
+
+def resolve_expected_category(meta: Dict[str, Any], post_import_categories: Dict[str, str]) -> Optional[str]:
+    """Which post-import category this torrent should end up in. Uses the
+    download client name saved when it was paused; if that's missing (older
+    state entries) and the Arr instance only has one client with a
+    post-import category, that one is unambiguous."""
+    client = meta.get("download_client")
+    if client and client in post_import_categories:
+        return post_import_categories[client]
+    if not client and len(post_import_categories) == 1:
+        return next(iter(post_import_categories.values()))
+    return None
 
 
 def delete_arr_queue_item(base_url: str, api_key: str, queue_id: Any, remove_from_client: bool = False,
@@ -774,7 +858,8 @@ def decide_purge(tracker_min_mb: Optional[float], downloaded_bytes: Optional[flo
 def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase: str,
                         winner_name: str, winner_score: Any, loser_score: Any,
                         winner_indexer: str, loser_indexer: str, tracker_min_mb: Optional[float],
-                        winner_progress: Optional[float] = None) -> Dict[str, Any]:
+                        winner_progress: Optional[float] = None,
+                        download_client: Optional[str] = None) -> Dict[str, Any]:
     """The tracked_state record shape - was built as an identical inline
     dict literal at both the point a loser is first paused and the point a
     pending_check resolves into one."""
@@ -793,12 +878,15 @@ def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase:
         "loser_indexer": loser_indexer,
         "tracker_min_mb": tracker_min_mb,
         "winner_progress": winner_progress,
+        "download_client": download_client,
     }
 
 
 def process_service(app_label: str, base_url: str, api_key: str, proxy_client: QBitProxyClient,
                      media_key: str, app_type: str, tracked_state: Dict[str, Any],
-                     queue: List[Dict[str, Any]], safe_to_resume: bool) -> None:
+                     queue: List[Dict[str, Any]], safe_to_resume: bool,
+                     post_import_categories: Optional[Dict[str, str]] = None) -> None:
+    post_import_categories = post_import_categories or {}
     log(f"[{app_label}] Found {len(queue)} items in queue.")
     if not queue and not tracked_state:
         return
@@ -921,7 +1009,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
                     h, name, target_id, app_label, "pending_check",
                     winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
-                    winner_progress,
+                    winner_progress, loser.get("downloadClient"),
                 )
                 freshly_tracked_this_run.add(f"{app_label}:{h}")
                 continue
@@ -948,7 +1036,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
                     h, name, target_id, app_label, "paused",
                     winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
-                    winner_progress,
+                    winner_progress, loser.get("downloadClient"),
                 )
                 freshly_tracked_this_run.add(f"{app_label}:{h}")
                 record_event("pause", app_name=app_type, app_label=app_label, name=name, score=loser_score,
@@ -977,6 +1065,20 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 continue
 
             progress = normalize_progress(live_data.get("progress", 0.0))
+
+            # Self-heal the category every run: covers a category change
+            # that didn't take at resume time, and anything that flips it
+            # back afterwards.
+            expected_category = meta.get("expected_category") or resolve_expected_category(meta, post_import_categories)
+            if expected_category and live_data.get("category") != expected_category:
+                if proxy_client.ensure_category(raw_hash, expected_category):
+                    log(f"[{app_label}] '{meta.get('name')}' category corrected to '{expected_category}'.")
+                    meta["expected_category"] = expected_category
+                elif progress >= 0.999:
+                    # Don't drop it with the wrong category - keep tracking
+                    # until the category sticks.
+                    log(f"[{app_label}] '{meta.get('name')}' finished but category still isn't '{expected_category}'; keeping it tracked to retry.")
+                    continue
 
             if progress >= 0.999:
                 log(f"[{app_label}] '{meta.get('name')}' finished downloading; no longer tracking.")
@@ -1066,11 +1168,24 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
 
             if outcome == "resumed":
                 suffix = f" after {attempts} attempt(s)" if attempts > 1 else ""
-                note = " (Arr queue cleared, Post-Import Category applied if configured)" if (queue_item and arr_ok) else ""
                 winner_name = meta.get("winner_name")
                 winner_note = f" - was superseded by `{winner_name}`, which has now finished" if winner_name else ""
-                log(f"[{app_label}] '{meta.get('name')}' resumed{suffix}.{note}")
-                record_event("resume", text=f"**{app_label}**: `{meta.get('name')}`{suffix}{winner_note}{note}")
+
+                # Don't trust Arr's changeCategory blindly - verify it, and
+                # set it directly if it didn't take (or if there was no Arr
+                # record to ask in the first place).
+                category_note = ""
+                expected_category = resolve_expected_category(meta, post_import_categories)
+                if expected_category:
+                    meta["expected_category"] = expected_category
+                    if proxy_client.ensure_category(raw_hash, expected_category):
+                        category_note = f" - moved to `{expected_category}`"
+                    else:
+                        category_note = f" - category change to `{expected_category}` not confirmed yet, will keep retrying"
+                        record_event("error", text=f"**{app_label}**: `{meta.get('name')}` resumed but couldn't be moved to `{expected_category}` yet - retrying every run")
+
+                log(f"[{app_label}] '{meta.get('name')}' resumed{suffix}.{category_note}")
+                record_event("resume", text=f"**{app_label}**: `{meta.get('name')}`{suffix}{winner_note}{category_note}")
                 meta["phase"] = "completing"
                 meta["resume_attempts"] = 0
                 meta["consecutive_unreachable"] = 0
@@ -1377,8 +1492,9 @@ def main() -> None:
     for inst in valid_instances:
         label = inst["label"]
         media_key = "episodeId" if inst["type"] == "Sonarr" else "movieId"
+        post_import_categories = get_post_import_categories(inst["base_url"], inst["api_key"], inst["type"])
         process_service(label, inst["base_url"], inst["api_key"], proxy_clients[label], media_key, inst["type"],
-                         tracked_state, instance_queues[label], safe_to_resume)
+                         tracked_state, instance_queues[label], safe_to_resume, post_import_categories)
 
     save_tracked_state(tracked_state)
     send_discord_batch(DISCORD_EVENTS)

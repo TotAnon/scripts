@@ -8,6 +8,27 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.5.0] - 2026-11-05
+
+### Fixed (ported from the standalone `arr_qui_watcher2.py` variant)
+- **Arr queue is now fetched in full, page by page.** Only the first 100
+  records were ever read before. A paused loser (or its winner) sitting
+  past that point looked like it "didn't exist" in Arr - so at resume
+  time the Arr `changeCategory` call was skipped and the category never
+  changed.
+- **Post-import category is now verified, not assumed.** After a loser
+  resumes, the script reads each download client's configured
+  Post-Import Category from Arr (Settings > Download Clients) and
+  confirms the torrent actually landed in it, setting it directly in qBit
+  if Arr's `changeCategory` didn't take. It keeps re-checking every run
+  while the torrent finishes, and won't stop tracking a finished torrent
+  until its category is correct. A no-op if you don't use a post-import
+  category.
+- Each tracked loser now remembers which download client it came from,
+  so the right post-import category is picked when an Arr instance has
+  more than one client. Older state entries without it still work when
+  only one client has a post-import category configured.
+
 ## [1.4.0] - 2026-11-05
 
 ### Fixed
