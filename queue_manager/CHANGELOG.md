@@ -8,6 +8,28 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.7.0] - 2026-11-05
+
+### Added
+- **A resumed loser is paused again if something else starts
+  downloading.** Before, once a loser resumed it kept downloading until
+  it finished, even if a new episode or movie got added in the meantime.
+  Now, on each run, if anything else on any of your qBittorrent clients
+  is actively downloading, the loser is paused again, re-tagged, and goes
+  back to waiting. It resumes as before once everything else is done, and
+  this can repeat as often as needed. Each re-pause is logged and posted
+  to Discord under "⏸️ Re-paused".
+- Uses the same "actively downloading" check as resuming (download speed
+  above 0), so a finished download stuck on an import error, or a stalled
+  torrent, doesn't trigger a re-pause.
+
+### Changed
+- The "is anything downloading" check now ignores the losers the script
+  itself is managing. Without that, a resumed loser would count as
+  "something else downloading" and pause itself. It also means paused
+  losers no longer wait for each other: once real downloads are done,
+  they can all finish at the same time instead of one at a time.
+
 ## [1.6.0] - 2026-11-05
 
 ### Changed
