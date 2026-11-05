@@ -74,16 +74,6 @@ settings:
   # sending a Discord error alert. Resets whenever qBit responds again.
   resume_max_attempts_before_alert: 60
 
-  # Tie-break dimension used BETWEEN customFormatScore and live qBit
-  # progress when ranking duplicate/competing grabs: if two releases tie
-  # on score AND resolution, the one whose quality.quality.source matches
-  # higher up this list wins outright (no need to fall back to progress).
-  # Most-preferred first. A source Arr doesn't report, or that isn't in
-  # this list, is neutral - it never invents a ranking out of missing
-  # data, so this is safe to leave as-is even if your Arr version doesn't
-  # expose quality.quality.source at all.
-  source_rank_order: [bluray, web, webdl, webrip, hdtv, dvd, sdtv]
-
 # ── Discord ───────────────────────────────────────────────────────────────
 discord:
   webhook_url: ""   # leave blank to disable

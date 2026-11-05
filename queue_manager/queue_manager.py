@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -83,17 +83,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "excluded_trackers": [],
         "tracker_overrides": [],  # [{name: str, min_mb: float}, ...]
         "resume_max_attempts_before_alert": 50,
-        # Tie-break dimension between customFormatScore and live qBit
-        # progress (see calculate_rank's docstring): ranks a release's
-        # quality.quality.source against this list, most-preferred first.
-        # Only kicks in when two candidates already tie on score AND
-        # resolution - i.e. this exists to stop a same-score,
-        # same-resolution-but-different-source pair (e.g. WEBDL vs Bluray)
-        # from being treated as a pure duplicate and decided by progress
-        # alone. A source missing from this list, or missing from Arr's
-        # queue data entirely, ranks neutrally (no effect either way) -
-        # safe to extend or leave as-is.
-        "source_rank_order": ["bluray", "web", "webdl", "webrip", "hdtv", "dvd", "sdtv"],
     },
     "discord": {
         "webhook_url": "",
@@ -141,7 +130,6 @@ PURGE_PROGRESS_THRESHOLD: float
 ENABLE_PURGE: bool
 EXCLUDED_TRACKERS: List[str] = []
 TRACKER_MB_THRESHOLDS: List[Tuple[str, float]] = []
-SOURCE_RANK_ORDER: List[str] = []
 DISCORD_WEBHOOK_URL: str = ""
 RESUME_MAX_ATTEMPTS_BEFORE_ALERT: int
 
@@ -679,11 +667,16 @@ def any_active_download(proxy_clients: List["QBitProxyClient"]) -> bool:
 # Arr API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_arr_queue(base_url: str, api_key: str, page_size: int = 250) -> List[Dict[str, Any]]:
+def get_arr_queue(base_url: str, api_key: str, app_type: str, page_size: int = 250) -> List[Dict[str, Any]]:
     """Fetches the ENTIRE queue, page by page. Only reading the first page
     meant a paused loser (or its winner) could sit on page 2+ and be
     invisible - so at resume time its Arr record 'didn't exist', the Arr
-    changeCategory call was skipped, and the category never changed."""
+    changeCategory call was skipped, and the category never changed.
+
+    Also asks Arr to embed each record's series (Sonarr) / movie (Radarr),
+    which carries its qualityProfileId - that's how ranking finds the
+    profile a queue item belongs to without an extra API call per item."""
+    include_param = "includeSeries" if app_type == "Sonarr" else "includeMovie"
     records: List[Dict[str, Any]] = []
     page = 1
     try:
@@ -691,7 +684,8 @@ def get_arr_queue(base_url: str, api_key: str, page_size: int = 250) -> List[Dic
             res = requests.get(
                 f"{base_url.rstrip('/')}/api/v3/queue",
                 headers={"X-Api-Key": api_key},
-                params={"includeUnknownSeriesItems": "true", "pageSize": page_size, "page": page},
+                params={"includeUnknownSeriesItems": "true", include_param: "true",
+                        "pageSize": page_size, "page": page},
                 timeout=15
             )
             res.raise_for_status()
@@ -773,41 +767,120 @@ def delete_arr_queue_item(base_url: str, api_key: str, queue_id: Any, remove_fro
         return False
 
 
-def get_source_rank(item: Dict[str, Any], rank_order: List[str]) -> int:
-    """Where this source falls in settings.source_rank_order, highest
-    first (len(rank_order) for the first/most-preferred entry, down to 1
-    for the last, 0 if the source is missing from Arr's data or isn't in
-    the list at all). A 0 is neutral by construction: two items that both
-    come back 0 (no source data on either, or a source neither config
-    entry names) compare equal on this dimension, same as if it didn't
-    exist - this can only ever sharpen an existing tie, never invent a
-    new ranking out of missing data."""
-    source = str(item.get("quality", {}).get("quality", {}).get("source") or "").strip().lower()
-    if not source or not rank_order:
-        return 0
-    for i, candidate in enumerate(rank_order):
-        if candidate and candidate in source:
-            return len(rank_order) - i
-    return 0
+def get_quality_profile_rankings(base_url: str, api_key: str) -> Optional[Dict[int, Dict[int, int]]]:
+    """Reads every quality profile from Arr once and turns each into
+    {quality_id: position}, where a higher position means Arr prefers it
+    more - the same order Arr's own upgrade logic uses. Returns None if the
+    profiles can't be read (ranking then treats quality as equal and falls
+    through to CF score, rather than guessing).
+
+    Arr's API lists a profile's items lowest-to-highest (the UI shows them
+    reversed), so the list index is the position. A grouped entry (e.g.
+    "WEB 1080p" holding WEBDL-1080p and WEBRip-1080p) gives every member the
+    group's single index, so qualities in the same group compare equal,
+    exactly as Arr treats them. Disallowed qualities keep their position -
+    Arr still orders them, and something may already be grabbed in one."""
+    try:
+        res = requests.get(
+            f"{base_url.rstrip('/')}/api/v3/qualityprofile",
+            headers={"X-Api-Key": api_key},
+            timeout=10
+        )
+        res.raise_for_status()
+        profiles = res.json()
+    except Exception as e:
+        log(f"[Arr API] Could not read quality profiles from {base_url}: {e}")
+        return None
+
+    rankings: Dict[int, Dict[int, int]] = {}
+    for prof in profiles if isinstance(profiles, list) else []:
+        positions: Dict[int, int] = {}
+        for idx, entry in enumerate(prof.get("items") or []):
+            q = entry.get("quality") or {}
+            if q.get("id") is not None:
+                positions[q["id"]] = idx
+            for member in entry.get("items") or []:
+                mq = member.get("quality") or {}
+                if mq.get("id") is not None:
+                    positions[mq["id"]] = idx
+        if prof.get("id") is not None:
+            rankings[prof["id"]] = positions
+    return rankings
 
 
-def calculate_rank(item: Dict[str, Any], source_rank: int = 0, progress: float = 0.0) -> Tuple[int, int, int, float]:
-    """(customFormatScore, quality resolution, source rank, live qBit
-    progress). Each dimension only ever breaks a tie in the one before it -
-    source_rank only matters when score AND resolution already tie (e.g.
-    the same resolution grabbed as both a WEBDL and a Bluray release), and
-    progress only matters once score, resolution AND source all tie too.
-    Without progress as the final tiebreaker, two items tied on everything
-    else sort by Python's stable-sort fallback, i.e. whatever order Arr's
-    queue API happened to return them in - which has no relationship to
-    which one is actually further along in qBit, and can pick a
-    freshly-grabbed duplicate as the 'winner' over a release that's
-    already mostly downloaded. See get_source_rank's docstring for why a
-    missing/unrecognized source is always neutral rather than a tiebreak
-    of its own."""
-    score = item.get("customFormatScore", 0)
-    quality_weight = item.get("quality", {}).get("quality", {}).get("resolution", 0)
-    return (score, quality_weight, source_rank, progress)
+def queue_item_profile_id(item: Dict[str, Any]) -> Optional[int]:
+    """qualityProfileId of the series/movie this queue item belongs to
+    (embedded by get_arr_queue's includeSeries/includeMovie)."""
+    for key in ("series", "movie"):
+        pid = (item.get(key) or {}).get("qualityProfileId")
+        if pid is not None:
+            return pid
+    return None
+
+
+def resolve_quality_positions(items: List[Dict[str, Any]],
+                              profile_rankings: Optional[Dict[int, Dict[int, int]]]) -> Tuple[Dict[str, int], List[str]]:
+    """Each candidate's position in its own quality profile, keyed by
+    lowercase downloadId. If ANY candidate's position can't be determined
+    (profiles unreadable, no profile on its series/movie, profile id
+    unknown, or its quality not in the profile), returns no positions at
+    all plus the reasons - so quality counts as equal for the whole group
+    and CF score decides. Equal-for-everyone is the only consistent way to
+    'not guess': comparing some known positions against an unknown one
+    would just invent an ordering."""
+    if profile_rankings is None:
+        return {}, ["quality profiles couldn't be read from this instance"]
+
+    positions: Dict[str, int] = {}
+    problems: List[str] = []
+    for item in items:
+        dl_id = (item.get("downloadId") or "").lower()
+        title = item.get("title") or dl_id
+        quality = (item.get("quality") or {}).get("quality") or {}
+        qid, qname = quality.get("id"), quality.get("name") or "unknown"
+        pid = queue_item_profile_id(item)
+        if pid is None:
+            problems.append(f"{title!r} has no quality profile on its series/movie")
+        elif pid not in profile_rankings:
+            problems.append(f"{title!r} uses profile id {pid}, which wasn't in the profiles Arr returned")
+        elif qid is None or qid not in profile_rankings[pid]:
+            problems.append(f"{title!r} has quality {qname!r}, which isn't in profile id {pid}")
+        else:
+            positions[dl_id] = profile_rankings[pid][qid]
+    if problems:
+        return {}, problems
+    return positions, []
+
+
+RANK_FACTORS = ("quality", "CF", "revision", "progress")
+
+
+def calculate_rank(item: Dict[str, Any], quality_position: int = 0,
+                   progress: float = 0.0) -> Tuple[int, int, Tuple[int, int], float]:
+    """Same priority as Sonarr/Radarr's own upgrade logic:
+      1. quality position in the item's own quality profile
+      2. customFormatScore - only breaks a tie in quality
+      3. revision (version, then real) - a PROPER/REPACK beats the original
+      4. live qBit progress - only for true duplicates where everything
+         above ties; otherwise Python's stable sort would fall back to
+         whatever order Arr's queue API happened to return, which can pick
+         a fresh duplicate over a release that's already mostly downloaded.
+    Each element only matters when every element before it is equal."""
+    score = item.get("customFormatScore") or 0
+    revision = (item.get("quality") or {}).get("revision") or {}
+    try:
+        rev = (int(revision.get("version") or 1), int(revision.get("real") or 0))
+    except (TypeError, ValueError):
+        rev = (1, 0)
+    return (quality_position, score, rev, progress)
+
+
+def deciding_factor(winner_key: tuple, loser_key: tuple) -> str:
+    """Which ranking element first separated the winner from this loser."""
+    for name, w, l in zip(RANK_FACTORS, winner_key, loser_key):
+        if w != l:
+            return name
+    return "nothing (full tie, kept Arr's queue order)"
 
 
 def normalize_progress(raw_progress: float) -> float:
@@ -885,7 +958,8 @@ def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase:
 def process_service(app_label: str, base_url: str, api_key: str, proxy_client: QBitProxyClient,
                      media_key: str, app_type: str, tracked_state: Dict[str, Any],
                      queue: List[Dict[str, Any]], safe_to_resume: bool,
-                     post_import_categories: Optional[Dict[str, str]] = None) -> None:
+                     post_import_categories: Optional[Dict[str, str]] = None,
+                     profile_rankings: Optional[Dict[int, Dict[int, int]]] = None) -> None:
     post_import_categories = post_import_categories or {}
     log(f"[{app_label}] Found {len(queue)} items in queue.")
     if not queue and not tracked_state:
@@ -926,16 +1000,23 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
         if len(fresh_items) <= 1:
             continue
 
-        # Rank on (customFormatScore, quality resolution, source) first -
-        # the common case is a real upgrade, which this alone already
-        # decides, with no qBit round trips needed. Only when multiple
-        # candidates are genuinely tied on all three does live progress
-        # matter (see calculate_rank's docstring) - so only pay for those
-        # lookups, and only for the items actually tied for first place,
-        # not every candidate in the group.
-        fresh_items.sort(key=lambda i: calculate_rank(i, get_source_rank(i, SOURCE_RANK_ORDER)), reverse=True)
-        top_key = calculate_rank(fresh_items[0], get_source_rank(fresh_items[0], SOURCE_RANK_ORDER))[:3]
-        tied_at_top = [i for i in fresh_items if calculate_rank(i, get_source_rank(i, SOURCE_RANK_ORDER))[:3] == top_key]
+        # Rank by (quality position, CF, revision) first - the common case
+        # is a real upgrade, which this alone already decides, with no qBit
+        # round trips needed. Only when multiple candidates tie on all
+        # three does live progress matter (see calculate_rank's docstring)
+        # - so only pay for those lookups, and only for the items actually
+        # tied for first place, not every candidate in the group.
+        quality_positions, quality_problems = resolve_quality_positions(fresh_items, profile_rankings)
+        if quality_problems:
+            log(f"[{app_label}] Quality position unknown for target {target_id} - treating quality as equal "
+                f"and ranking by CF score: {'; '.join(quality_problems)}")
+
+        def qpos(i: Dict[str, Any]) -> int:
+            return quality_positions.get((i.get("downloadId") or "").lower(), 0)
+
+        fresh_items.sort(key=lambda i: calculate_rank(i, qpos(i)), reverse=True)
+        top_key = calculate_rank(fresh_items[0], qpos(fresh_items[0]))[:3]
+        tied_at_top = [i for i in fresh_items if calculate_rank(i, qpos(i))[:3] == top_key]
 
         item_progress: Dict[str, float] = {}
         if len(tied_at_top) > 1:
@@ -948,11 +1029,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                     item_progress[dl_id] = normalize_progress(live["progress"])
 
             fresh_items.sort(
-                key=lambda i: calculate_rank(
-                    i,
-                    get_source_rank(i, SOURCE_RANK_ORDER),
-                    item_progress.get((i.get("downloadId") or "").lower(), 0.0),
-                ),
+                key=lambda i: calculate_rank(i, qpos(i), item_progress.get((i.get("downloadId") or "").lower(), 0.0)),
                 reverse=True,
             )
 
@@ -960,7 +1037,10 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 f"{(i.get('title') or i.get('downloadId'))!r}={item_progress.get((i.get('downloadId') or '').lower(), 0.0) * 100:.1f}%"
                 for i in tied_at_top
             )
-            log(f"[{app_label}] Tied on score/resolution/source for target {target_id}, deciding by live progress: {tie_summary}")
+            log(f"[{app_label}] Tied on quality/CF/revision for target {target_id}, deciding by live progress: {tie_summary}")
+
+        def full_key(i: Dict[str, Any]) -> tuple:
+            return calculate_rank(i, qpos(i), item_progress.get((i.get("downloadId") or "").lower(), 0.0))
 
         winner_item = fresh_items[0]
         winner_name = winner_item.get("title") or winner_item.get("downloadId", "unknown release")
@@ -982,8 +1062,10 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 winner_progress = normalize_progress(live["progress"])
         winner_progress_label = f"{winner_progress * 100:.1f}%" if winner_progress is not None else "unknown"
 
-        log(f"[{app_label}] Superseded: winner='{winner_name}' [CF {winner_score}] [{winner_indexer}] "
-            f"({winner_progress_label} downloaded) over {len(superseded_items)} other candidate(s) for target {target_id}.")
+        winner_quality = ((winner_item.get("quality") or {}).get("quality") or {}).get("name") or "unknown quality"
+        log(f"[{app_label}] Superseded: winner='{winner_name}' [{winner_quality}] [CF {winner_score}] [{winner_indexer}] "
+            f"({winner_progress_label} downloaded) over {len(superseded_items)} other candidate(s) for target {target_id}, "
+            f"decided by {deciding_factor(full_key(winner_item), full_key(superseded_items[0]))}.")
 
         for loser in superseded_items:
             loser_hash = loser.get("downloadId")
@@ -994,6 +1076,10 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             loser_score = loser.get("customFormatScore", 0)
             raw_indexer = loser.get("indexer", "") or ""
             loser_indexer = clean_indexer_label(raw_indexer)
+
+            loser_quality = ((loser.get("quality") or {}).get("quality") or {}).get("name") or "unknown quality"
+            log(f"[{app_label}] '{loser.get('title', loser_hash)}' [{loser_quality}] [CF {loser_score}] loses to the winner "
+                f"on {deciding_factor(full_key(winner_item), full_key(loser))}.")
 
             if any(tracker_matches(t, raw_indexer) for t in EXCLUDED_TRACKERS):
                 log(f"[{app_label}] Skipping '{loser.get('title', loser_hash)}' - tracker '{raw_indexer}' is on the excluded list, leaving it untouched.")
@@ -1368,7 +1454,6 @@ def main() -> None:
     global SCRIPT_DIR, LOG_FILE, STATE_FILE, LOCK_FILE
     global PAUSE_TAG, PURGE_PROGRESS_THRESHOLD, ENABLE_PURGE
     global EXCLUDED_TRACKERS, TRACKER_MB_THRESHOLDS, DISCORD_WEBHOOK_URL, RESUME_MAX_ATTEMPTS_BEFORE_ALERT
-    global SOURCE_RANK_ORDER
 
     parser = argparse.ArgumentParser(description="Arr + qui queue watcher")
     parser.add_argument(
@@ -1424,7 +1509,6 @@ def main() -> None:
         if t.get("name", "").strip()
     ]
     RESUME_MAX_ATTEMPTS_BEFORE_ALERT = int(settings["resume_max_attempts_before_alert"])
-    SOURCE_RANK_ORDER = [str(s).strip().lower() for s in settings["source_rank_order"] if str(s).strip()]
 
     qui_url = (config.get("qui") or {}).get("url", "").strip()
     if not qui_url:
@@ -1485,7 +1569,7 @@ def main() -> None:
     # anything actually downloading right now, on any configured qBit
     # backend. See any_active_download's docstring for why this is based
     # on live qBit state (dlspeed) rather than Arr's queue listing.
-    instance_queues = {inst["label"]: get_arr_queue(inst["base_url"], inst["api_key"]) for inst in valid_instances}
+    instance_queues = {inst["label"]: get_arr_queue(inst["base_url"], inst["api_key"], inst["type"]) for inst in valid_instances}
     proxy_clients = {inst["label"]: QBitProxyClient(inst["qui_proxy"], qui_url) for inst in valid_instances}
     safe_to_resume = not any_active_download(list(proxy_clients.values()))
 
@@ -1493,8 +1577,13 @@ def main() -> None:
         label = inst["label"]
         media_key = "episodeId" if inst["type"] == "Sonarr" else "movieId"
         post_import_categories = get_post_import_categories(inst["base_url"], inst["api_key"], inst["type"])
+        # Fetched once per instance per run; every queue item reuses it.
+        profile_rankings = get_quality_profile_rankings(inst["base_url"], inst["api_key"])
+        if profile_rankings is None:
+            log(f"[{label}] Quality profiles unavailable this run - quality will count as equal and CF score will decide.")
         process_service(label, inst["base_url"], inst["api_key"], proxy_clients[label], media_key, inst["type"],
-                         tracked_state, instance_queues[label], safe_to_resume, post_import_categories)
+                         tracked_state, instance_queues[label], safe_to_resume, post_import_categories,
+                         profile_rankings)
 
     save_tracked_state(tracked_state)
     send_discord_batch(DISCORD_EVENTS)
