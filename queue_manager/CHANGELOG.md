@@ -8,6 +8,62 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.4.0] - 2026-11-05
+
+### Fixed
+- **Stuck-paused trumped torrents now resume correctly.** The resume gate
+  used to check whether a competing hash was still *present in Arr's
+  queue* - but a release that finished downloading and then got stuck on
+  an Arr-side import failure (bad naming, a matching error) stays in
+  Arr's queue indefinitely even though nothing is downloading it anymore.
+  A paused loser waiting on that release could stay paused forever. The
+  gate is now a single global check - is anything actually transferring
+  bytes right now, on any configured qBit backend (`dlspeed > 0`) -
+  computed from qBit's own live state instead of Arr's queue listing, so
+  a stuck import can no longer block a resume. Deliberately global
+  ("in either client") rather than per-release, per the report that
+  prompted this.
+- Deliberately speed-based, not state-string-based: a nominally
+  "downloading" torrent sitting at 0 throughput (stalled, no peers)
+  doesn't count as active either - the whole point is not trading one
+  flavor of "stuck forever" for another.
+- A loser can no longer resume in the same run it was just paused in,
+  regardless of how the global check happens to read at that instant
+  (restores a safety property the old per-release check had as a side
+  effect, now provided explicitly).
+
+### Changed
+- **Duplicate/near-duplicate grab ranking now also considers source.**
+  Previously ranked by `(customFormatScore, resolution)` only, with live
+  qBit progress as the tiebreaker on an exact tie. Two releases that tie
+  on score and resolution but differ in `quality.quality.source` (e.g.
+  the same 1080p episode as both a WEBDL and a Bluray grab) are no longer
+  treated as a pure duplicate decided by progress alone - source now
+  breaks that tie too, ranked by the new `settings.source_rank_order`
+  (default: bluray > web > webdl > webrip > hdtv > dvd > sdtv). A source
+  Arr doesn't report, or that isn't in the list, is neutral and never
+  invents a ranking out of missing data - no behavior change for anyone
+  without `quality.quality.source` in their Arr responses.
+- **Winner's progress is now always captured and shown**, not just the
+  loser's - in both the log line at decision time and the Discord
+  embed's Winner box. Previously only the loser's progress was visible
+  anywhere, so there was no way to tell after the fact whether
+  pausing/purging a partially-downloaded loser was actually justified by
+  a genuinely-further-along winner. Costs one extra qBit lookup, but only
+  when an actual supersede decision is being made, not on every idle run.
+- Added explicit logging of the full tie comparison (every tied
+  candidate's progress) whenever score/resolution/source all tie, so a
+  future "why did it pick that one" question is answerable straight from
+  the log.
+
+### Removed
+- `settings.wait_for_empty_queue_to_resume` - its "wait for the whole
+  system to go quiet before resuming" intent is now what the fixed global
+  resume gate does unconditionally; the old opt-in flag read the same
+  broken Arr-queue-presence signal as the per-release check above, so
+  keeping it around no longer made sense. A leftover key in an existing
+  yml is simply ignored, not an error.
+
 ## [1.3.0] - 2026-09-03
 
 ### Removed

@@ -58,12 +58,6 @@ settings:
   # tracked for later resume instead, regardless of progress/MB threshold.
   enable_purge: false
 
-  # If true, a paused loser won't resume even after its own race resolves
-  # until EVERY configured instance's queue is completely clear of anything
-  # else actively downloading. Can mean a paused loser waits a long time
-  # (or effectively never resumes) on a busy server.
-  wait_for_empty_queue_to_resume: false
-
   # Trackers to leave completely untouched - matched as a case-insensitive
   # substring against Arr's own "indexer" field.
   excluded_trackers: []
@@ -79,6 +73,16 @@ settings:
   # How many *consecutive unreachable* attempts (retried every run) before
   # sending a Discord error alert. Resets whenever qBit responds again.
   resume_max_attempts_before_alert: 60
+
+  # Tie-break dimension used BETWEEN customFormatScore and live qBit
+  # progress when ranking duplicate/competing grabs: if two releases tie
+  # on score AND resolution, the one whose quality.quality.source matches
+  # higher up this list wins outright (no need to fall back to progress).
+  # Most-preferred first. A source Arr doesn't report, or that isn't in
+  # this list, is neutral - it never invents a ranking out of missing
+  # data, so this is safe to leave as-is even if your Arr version doesn't
+  # expose quality.quality.source at all.
+  source_rank_order: [bluray, web, webdl, webrip, hdtv, dvd, sdtv]
 
 # ── Discord ───────────────────────────────────────────────────────────────
 discord:

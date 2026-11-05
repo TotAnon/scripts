@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -80,10 +80,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "pause_tag": "paused-by-supersede",
         "purge_progress_threshold": 0.10,
         "enable_purge": True,
-        "wait_for_empty_queue_to_resume": False,
         "excluded_trackers": [],
         "tracker_overrides": [],  # [{name: str, min_mb: float}, ...]
         "resume_max_attempts_before_alert": 50,
+        # Tie-break dimension between customFormatScore and live qBit
+        # progress (see calculate_rank's docstring): ranks a release's
+        # quality.quality.source against this list, most-preferred first.
+        # Only kicks in when two candidates already tie on score AND
+        # resolution - i.e. this exists to stop a same-score,
+        # same-resolution-but-different-source pair (e.g. WEBDL vs Bluray)
+        # from being treated as a pure duplicate and decided by progress
+        # alone. A source missing from this list, or missing from Arr's
+        # queue data entirely, ranks neutrally (no effect either way) -
+        # safe to extend or leave as-is.
+        "source_rank_order": ["bluray", "web", "webdl", "webrip", "hdtv", "dvd", "sdtv"],
     },
     "discord": {
         "webhook_url": "",
@@ -129,9 +139,9 @@ LOCK_FILE: Path
 PAUSE_TAG: str
 PURGE_PROGRESS_THRESHOLD: float
 ENABLE_PURGE: bool
-WAIT_FOR_EMPTY_QUEUE_TO_RESUME: bool
 EXCLUDED_TRACKERS: List[str] = []
 TRACKER_MB_THRESHOLDS: List[Tuple[str, float]] = []
+SOURCE_RANK_ORDER: List[str] = []
 DISCORD_WEBHOOK_URL: str = ""
 RESUME_MAX_ATTEMPTS_BEFORE_ALERT: int
 
@@ -197,8 +207,9 @@ def record_event(kind: str, **fields) -> None:
     'error' and 'resume' take a single 'text' field (a fully formatted line).
     'purge' and 'pause' take: app_name, name, score, amount_display,
     winner_name, winner_score, winner_indexer, loser_indexer, and
-    optionally 'note' - these get grouped by release (season/title) and
-    rendered as Winner/Loser boxes rather than flat lines."""
+    optionally 'note'/'winner_progress' - these get grouped by release
+    (season/title) and rendered as Winner/Loser boxes rather than flat
+    lines."""
     DISCORD_EVENTS.append({"kind": kind, **fields})
 
 
@@ -258,9 +269,12 @@ def build_grouped_embed(kind_events: List[Dict[str, Any]], title: str, color: in
             w_name = it.get("winner_name") or "unknown release"
             w_score = it.get("winner_score")
             w_indexer = it.get("winner_indexer")
+            w_progress = it.get("winner_progress")
             w_line = f"{w_name} [CF {w_score}]" if w_score is not None else w_name
             if w_indexer:
                 w_line += f" [{w_indexer}]"
+            if w_progress is not None:
+                w_line += f" — {w_progress * 100:.1f}%"
             if w_line not in seen_winners:
                 seen_winners.add(w_line)
                 winner_lines.append(w_line)
@@ -441,6 +455,25 @@ class QBitProxyClient:
 
         return None
 
+    def get_all_torrents(self) -> List[Dict[str, Any]]:
+        """Every torrent on this backend, unfiltered - used for the global
+        'is anything actually downloading' resume gate. Deliberately not
+        keyed off Arr's queue listing: a torrent that finished downloading
+        but is stuck on an Arr-side import failure (bad naming, a matching
+        error) stays in Arr's queue indefinitely even though nothing is
+        downloading it anymore - this looks at qBit's own live state
+        instead, so a stuck-on-import entry can't block an unrelated paused
+        loser from resuming forever."""
+        try:
+            res = self.session.get(f"{self.base_url}/api/v2/torrents/info", timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            log(f"[Proxy] Error fetching full torrent list: {e}")
+        return []
+
     def pause_only(self, torrent_hash: str, verify_attempts: int = 3, verify_delay: float = 1.0) -> bool:
         """Pause immediately, before any progress-threshold decision is made,
         and verify the state actually changed. qBittorrent can return 200 for
@@ -584,6 +617,34 @@ class QBitProxyClient:
         return "resumed"
 
 
+def any_active_download(proxy_clients: List["QBitProxyClient"]) -> bool:
+    """The global resume gate: true if any torrent on any configured qBit
+    backend is actually transferring bytes right now (dlspeed > 0).
+
+    Deliberately speed-based rather than state-string-based - a torrent
+    sitting in a nominally 'downloading' lifecycle state (queuedDL,
+    stalledDL, checkingDL) with zero throughput is, for this purpose,
+    exactly the kind of 'stuck' thing a paused loser shouldn't wait on
+    forever either. One stalled, dead torrent anywhere would otherwise
+    block every paused resume indefinitely, the same class of bug this
+    whole check exists to get away from.
+
+    This is a point-in-time read: a torrent between pieces can
+    legitimately show 0 speed for a moment. A false 'nothing's downloading'
+    reading here could let a loser resume one run earlier than ideal,
+    briefly contending for bandwidth with a winner that's about to pick
+    back up - self-limited to that one window, not worth guarding against
+    at the cost of resurrecting the stuck-forever problem."""
+    for client in proxy_clients:
+        for t in client.get_all_torrents():
+            try:
+                if float(t.get("dlspeed", 0)) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Arr API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -628,17 +689,41 @@ def delete_arr_queue_item(base_url: str, api_key: str, queue_id: Any, remove_fro
         return False
 
 
-def calculate_rank(item: Dict[str, Any], progress: float = 0.0) -> Tuple[int, int, float]:
-    """(customFormatScore, quality resolution, live qBit progress). Progress
-    is last so it never overrides a genuine CF/quality difference - it only
-    breaks a true tie. Without it, two items tied on score and quality sort
-    by Python's stable-sort fallback, i.e. whatever order Arr's queue API
-    happened to return them in - which has no relationship to which one is
-    actually further along in qBit, and can pick a freshly-grabbed duplicate
-    as the 'winner' over a release that's already mostly downloaded."""
+def get_source_rank(item: Dict[str, Any], rank_order: List[str]) -> int:
+    """Where this source falls in settings.source_rank_order, highest
+    first (len(rank_order) for the first/most-preferred entry, down to 1
+    for the last, 0 if the source is missing from Arr's data or isn't in
+    the list at all). A 0 is neutral by construction: two items that both
+    come back 0 (no source data on either, or a source neither config
+    entry names) compare equal on this dimension, same as if it didn't
+    exist - this can only ever sharpen an existing tie, never invent a
+    new ranking out of missing data."""
+    source = str(item.get("quality", {}).get("quality", {}).get("source") or "").strip().lower()
+    if not source or not rank_order:
+        return 0
+    for i, candidate in enumerate(rank_order):
+        if candidate and candidate in source:
+            return len(rank_order) - i
+    return 0
+
+
+def calculate_rank(item: Dict[str, Any], source_rank: int = 0, progress: float = 0.0) -> Tuple[int, int, int, float]:
+    """(customFormatScore, quality resolution, source rank, live qBit
+    progress). Each dimension only ever breaks a tie in the one before it -
+    source_rank only matters when score AND resolution already tie (e.g.
+    the same resolution grabbed as both a WEBDL and a Bluray release), and
+    progress only matters once score, resolution AND source all tie too.
+    Without progress as the final tiebreaker, two items tied on everything
+    else sort by Python's stable-sort fallback, i.e. whatever order Arr's
+    queue API happened to return them in - which has no relationship to
+    which one is actually further along in qBit, and can pick a
+    freshly-grabbed duplicate as the 'winner' over a release that's
+    already mostly downloaded. See get_source_rank's docstring for why a
+    missing/unrecognized source is always neutral rather than a tiebreak
+    of its own."""
     score = item.get("customFormatScore", 0)
     quality_weight = item.get("quality", {}).get("quality", {}).get("resolution", 0)
-    return (score, quality_weight, progress)
+    return (score, quality_weight, source_rank, progress)
 
 
 def normalize_progress(raw_progress: float) -> float:
@@ -688,7 +773,8 @@ def decide_purge(tracker_min_mb: Optional[float], downloaded_bytes: Optional[flo
 
 def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase: str,
                         winner_name: str, winner_score: Any, loser_score: Any,
-                        winner_indexer: str, loser_indexer: str, tracker_min_mb: Optional[float]) -> Dict[str, Any]:
+                        winner_indexer: str, loser_indexer: str, tracker_min_mb: Optional[float],
+                        winner_progress: Optional[float] = None) -> Dict[str, Any]:
     """The tracked_state record shape - was built as an identical inline
     dict literal at both the point a loser is first paused and the point a
     pending_check resolves into one."""
@@ -706,12 +792,13 @@ def make_tracked_entry(h: str, name: str, target_id: Any, app_label: str, phase:
         "winner_indexer": winner_indexer,
         "loser_indexer": loser_indexer,
         "tracker_min_mb": tracker_min_mb,
+        "winner_progress": winner_progress,
     }
 
 
 def process_service(app_label: str, base_url: str, api_key: str, proxy_client: QBitProxyClient,
                      media_key: str, app_type: str, tracked_state: Dict[str, Any],
-                     queue: List[Dict[str, Any]], queue_globally_clear: bool) -> None:
+                     queue: List[Dict[str, Any]], safe_to_resume: bool) -> None:
     log(f"[{app_label}] Found {len(queue)} items in queue.")
     if not queue and not tracked_state:
         return
@@ -730,11 +817,6 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
 
         grouped.setdefault(target_id, []).append(item)
 
-    target_hash_map = {
-        target_id: {i.get("downloadId", "").lower() for i in items if i.get("downloadId")}
-        for target_id, items in grouped.items()
-    }
-
     hash_to_queue_item = {
         i.get("downloadId", "").lower(): i
         for items in grouped.values() for i in items
@@ -742,6 +824,13 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
     }
 
     already_tracked_hashes = {meta.get("hash", k) for k, meta in tracked_state.items() if meta.get("service") == app_label}
+    # Keys created by the detection loop below, during this very call -
+    # the resume-management pass that follows skips these regardless of
+    # safe_to_resume: a loser should never be allowed to resume in the
+    # same run it was just paused in, however the global check happens to
+    # read at that instant (see any_active_download's docstring on why
+    # that's a point-in-time signal, not a guarantee).
+    freshly_tracked_this_run: set = set()
 
     # ----- Detect new supersede events (skip hashes we're already tracking/managing) -----
     for target_id, items in grouped.items():
@@ -749,19 +838,19 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
         if len(fresh_items) <= 1:
             continue
 
-        # Rank on (customFormatScore, quality) alone first - the common
-        # case is a real upgrade, which this alone already decides, with no
-        # qBit round trips needed. Only when multiple candidates are
-        # genuinely tied at the top does live progress matter (see
-        # calculate_rank's docstring) - so only pay for those lookups, and
-        # only for the items actually tied for first place, not every
-        # candidate in the group.
-        fresh_items.sort(key=calculate_rank, reverse=True)
-        top_key = calculate_rank(fresh_items[0])[:2]
-        tied_at_top = [i for i in fresh_items if calculate_rank(i)[:2] == top_key]
+        # Rank on (customFormatScore, quality resolution, source) first -
+        # the common case is a real upgrade, which this alone already
+        # decides, with no qBit round trips needed. Only when multiple
+        # candidates are genuinely tied on all three does live progress
+        # matter (see calculate_rank's docstring) - so only pay for those
+        # lookups, and only for the items actually tied for first place,
+        # not every candidate in the group.
+        fresh_items.sort(key=lambda i: calculate_rank(i, get_source_rank(i, SOURCE_RANK_ORDER)), reverse=True)
+        top_key = calculate_rank(fresh_items[0], get_source_rank(fresh_items[0], SOURCE_RANK_ORDER))[:3]
+        tied_at_top = [i for i in fresh_items if calculate_rank(i, get_source_rank(i, SOURCE_RANK_ORDER))[:3] == top_key]
 
+        item_progress: Dict[str, float] = {}
         if len(tied_at_top) > 1:
-            item_progress: Dict[str, float] = {}
             for i in tied_at_top:
                 dl_id = (i.get("downloadId") or "").lower()
                 if not dl_id:
@@ -771,15 +860,42 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                     item_progress[dl_id] = normalize_progress(live["progress"])
 
             fresh_items.sort(
-                key=lambda i: calculate_rank(i, item_progress.get((i.get("downloadId") or "").lower(), 0.0)),
+                key=lambda i: calculate_rank(
+                    i,
+                    get_source_rank(i, SOURCE_RANK_ORDER),
+                    item_progress.get((i.get("downloadId") or "").lower(), 0.0),
+                ),
                 reverse=True,
             )
+
+            tie_summary = ", ".join(
+                f"{(i.get('title') or i.get('downloadId'))!r}={item_progress.get((i.get('downloadId') or '').lower(), 0.0) * 100:.1f}%"
+                for i in tied_at_top
+            )
+            log(f"[{app_label}] Tied on score/resolution/source for target {target_id}, deciding by live progress: {tie_summary}")
 
         winner_item = fresh_items[0]
         winner_name = winner_item.get("title") or winner_item.get("downloadId", "unknown release")
         winner_score = winner_item.get("customFormatScore", 0)
         winner_indexer = clean_indexer_label(winner_item.get("indexer", ""))
         superseded_items = fresh_items[1:]
+
+        # Fetched/logged for every decision, not just tied ones - so a log
+        # or Discord message always shows what the winner's own progress
+        # was, not just the loser's. Without this, there's no way to tell
+        # after the fact whether pausing/purging a partially-downloaded
+        # loser was actually justified by a genuinely-further-along
+        # winner, or just by a tie-break/ranking quirk.
+        winner_hash = (winner_item.get("downloadId") or "").lower()
+        winner_progress = item_progress.get(winner_hash)
+        if winner_progress is None and winner_hash:
+            live = proxy_client.get_live_torrent(winner_hash)
+            if live and "progress" in live:
+                winner_progress = normalize_progress(live["progress"])
+        winner_progress_label = f"{winner_progress * 100:.1f}%" if winner_progress is not None else "unknown"
+
+        log(f"[{app_label}] Superseded: winner='{winner_name}' [CF {winner_score}] [{winner_indexer}] "
+            f"({winner_progress_label} downloaded) over {len(superseded_items)} other candidate(s) for target {target_id}.")
 
         for loser in superseded_items:
             loser_hash = loser.get("downloadId")
@@ -805,7 +921,9 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
                     h, name, target_id, app_label, "pending_check",
                     winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
+                    winner_progress,
                 )
+                freshly_tracked_this_run.add(f"{app_label}:{h}")
                 continue
 
             progress, live_name, downloaded_bytes = result
@@ -823,29 +941,28 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 else:
                     record_event("purge", app_name=app_type, app_label=app_label, name=name, score=loser_score,
                                  amount_display=amount_label, winner_name=winner_name, winner_score=winner_score,
-                                 winner_indexer=winner_indexer, loser_indexer=loser_indexer)
+                                 winner_indexer=winner_indexer, loser_indexer=loser_indexer, winner_progress=winner_progress)
             else:
                 log(f"[{app_label}] [Live qBit, post-pause] {amount_label}. Tagging + deprioritizing '{name}' (already paused){' - would have purged, but ENABLE_PURGE is disabled' if disabled_note else ''}")
                 proxy_client.tag_and_deprioritize(h)
                 tracked_state[f"{app_label}:{h}"] = make_tracked_entry(
                     h, name, target_id, app_label, "paused",
                     winner_name, winner_score, loser_score, winner_indexer, loser_indexer, tracker_min_mb,
+                    winner_progress,
                 )
+                freshly_tracked_this_run.add(f"{app_label}:{h}")
                 record_event("pause", app_name=app_type, app_label=app_label, name=name, score=loser_score,
                              amount_display=amount_label, winner_name=winner_name, winner_score=winner_score,
-                             winner_indexer=winner_indexer, loser_indexer=loser_indexer, note=disabled_note)
+                             winner_indexer=winner_indexer, loser_indexer=loser_indexer, note=disabled_note,
+                             winner_progress=winner_progress)
 
     # ----- Resume-management pass -----
-    # Recomputed rather than reusing already_tracked_hashes above (even
-    # though the expression is identical) - the detection pass just above
-    # may have added new entries to tracked_state, and those need to count
-    # here too so a hash we just started tracking this very run isn't
-    # mistaken for "still actively competing" below.
-    tracked_hashes_this_app = {meta.get("hash", k) for k, meta in tracked_state.items() if meta.get("service") == app_label}
     to_drop = []
 
     for thash, meta in list(tracked_state.items()):
         if meta.get("service") != app_label:
+            continue
+        if thash in freshly_tracked_this_run:
             continue
 
         raw_hash = meta.get("hash", thash)
@@ -884,6 +1001,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             winner_indexer = meta.get("winner_indexer", "")
             loser_indexer = meta.get("loser_indexer", "")
             tracker_min_mb = meta.get("tracker_min_mb")
+            winner_progress = meta.get("winner_progress")
 
             would_purge, should_purge, amount_label = decide_purge(tracker_min_mb, downloaded_bytes, progress)
             note = "deletion disabled, confirmed on a follow-up check" if (would_purge and not ENABLE_PURGE) else "confirmed on a follow-up check"
@@ -897,7 +1015,7 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                         record_event("purge", app_name=app_type, app_label=app_label, name=name, score=loser_score,
                                      amount_display=amount_label, winner_name=winner_name, winner_score=winner_score,
                                      winner_indexer=winner_indexer, loser_indexer=loser_indexer,
-                                     note="confirmed on a follow-up check")
+                                     note="confirmed on a follow-up check", winner_progress=winner_progress)
                         to_drop.append(thash)
                     else:
                         log(f"[{app_label}] Arr removal failed for '{name}'; will retry.")
@@ -912,23 +1030,19 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
                 record_event("pause", app_name=app_type, app_label=app_label, name=name, score=loser_score,
                              amount_display=amount_label, winner_name=winner_name, winner_score=winner_score,
                              winner_indexer=winner_indexer, loser_indexer=loser_indexer,
-                             note=note)
+                             note=note, winner_progress=winner_progress)
 
         elif phase == "paused":
-            target_id = meta.get("target_id")
-            competing_hashes = {
-                h for h in target_hash_map.get(target_id, set())
-                if h != raw_hash and h not in tracked_hashes_this_app
-            }
-            still_competing = len(competing_hashes) > 0
-
-            if still_competing:
+            # The only resume gate: nothing actively downloading anywhere
+            # (see any_active_download's docstring for why this replaced
+            # the old per-target "is a competing item still in Arr's
+            # queue" check - that check could never clear once a winner
+            # finished downloading but got stuck on an Arr-side import
+            # failure, since it stayed in Arr's queue forever even though
+            # nothing was downloading it anymore).
+            if not safe_to_resume:
                 proxy_client.bottom_queue(raw_hash)
-                continue
-
-            if WAIT_FOR_EMPTY_QUEUE_TO_RESUME and not queue_globally_clear:
-                proxy_client.bottom_queue(raw_hash)
-                log(f"[{app_label}] '{meta.get('name')}' could resume, but other instances still have active downloads; holding.")
+                log(f"[{app_label}] '{meta.get('name')}' could resume, but something is still actively downloading elsewhere; holding.")
                 continue
 
             attempts = meta.get("resume_attempts", 0) + 1
@@ -1137,8 +1251,9 @@ def check_for_updates(update_cfg: Dict[str, Any], notify_state_path: Path) -> No
 
 def main() -> None:
     global SCRIPT_DIR, LOG_FILE, STATE_FILE, LOCK_FILE
-    global PAUSE_TAG, PURGE_PROGRESS_THRESHOLD, ENABLE_PURGE, WAIT_FOR_EMPTY_QUEUE_TO_RESUME
+    global PAUSE_TAG, PURGE_PROGRESS_THRESHOLD, ENABLE_PURGE
     global EXCLUDED_TRACKERS, TRACKER_MB_THRESHOLDS, DISCORD_WEBHOOK_URL, RESUME_MAX_ATTEMPTS_BEFORE_ALERT
+    global SOURCE_RANK_ORDER
 
     parser = argparse.ArgumentParser(description="Arr + qui queue watcher")
     parser.add_argument(
@@ -1187,7 +1302,6 @@ def main() -> None:
     PAUSE_TAG = settings["pause_tag"]
     PURGE_PROGRESS_THRESHOLD = float(settings["purge_progress_threshold"])
     ENABLE_PURGE = bool(settings["enable_purge"])
-    WAIT_FOR_EMPTY_QUEUE_TO_RESUME = bool(settings["wait_for_empty_queue_to_resume"])
     EXCLUDED_TRACKERS = [t.strip() for t in settings["excluded_trackers"] if str(t).strip()]
     TRACKER_MB_THRESHOLDS = [
         (t.get("name", "").strip(), float(t.get("min_mb", 0)))
@@ -1195,6 +1309,7 @@ def main() -> None:
         if t.get("name", "").strip()
     ]
     RESUME_MAX_ATTEMPTS_BEFORE_ALERT = int(settings["resume_max_attempts_before_alert"])
+    SOURCE_RANK_ORDER = [str(s).strip().lower() for s in settings["source_rank_order"] if str(s).strip()]
 
     qui_url = (config.get("qui") or {}).get("url", "").strip()
     if not qui_url:
@@ -1249,25 +1364,21 @@ def main() -> None:
         log("=== Run Completed (no valid instances) ===")
         sys.exit(1)
 
-    # Pre-fetch each instance's current queue once, and use it to build the
-    # WAIT_FOR_EMPTY_QUEUE_TO_RESUME gate across every configured instance.
-    # Our own tracked/paused entries are excluded from "is it empty", since
-    # otherwise a paused loser would never see the queue as clear (it's
-    # sitting in Arr's own queue by design, precisely so it can be picked
-    # back up if the winner disappears).
+    # Pre-fetch each instance's current queue once, build one proxy client
+    # per instance (reused below so this doesn't open a second session per
+    # instance), and use those to compute the one global resume gate: is
+    # anything actually downloading right now, on any configured qBit
+    # backend. See any_active_download's docstring for why this is based
+    # on live qBit state (dlspeed) rather than Arr's queue listing.
     instance_queues = {inst["label"]: get_arr_queue(inst["base_url"], inst["api_key"]) for inst in valid_instances}
-    all_tracked_hashes = {meta.get("hash") for meta in tracked_state.values() if meta.get("hash")}
-    queue_globally_clear = not any(
-        any(item.get("downloadId", "").lower() not in all_tracked_hashes for item in q if item.get("downloadId"))
-        for q in instance_queues.values()
-    )
+    proxy_clients = {inst["label"]: QBitProxyClient(inst["qui_proxy"], qui_url) for inst in valid_instances}
+    safe_to_resume = not any_active_download(list(proxy_clients.values()))
 
     for inst in valid_instances:
         label = inst["label"]
         media_key = "episodeId" if inst["type"] == "Sonarr" else "movieId"
-        proxy_client = QBitProxyClient(inst["qui_proxy"], qui_url)
-        process_service(label, inst["base_url"], inst["api_key"], proxy_client, media_key, inst["type"],
-                         tracked_state, instance_queues[label], queue_globally_clear)
+        process_service(label, inst["base_url"], inst["api_key"], proxy_clients[label], media_key, inst["type"],
+                         tracked_state, instance_queues[label], safe_to_resume)
 
     save_tracked_state(tracked_state)
     send_discord_batch(DISCORD_EVENTS)
