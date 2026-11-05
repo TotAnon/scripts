@@ -8,6 +8,60 @@ notification with the changelog since your version - see the `update.*`
 config keys in `queue_manager.yml` for the source repo/branch, and the
 "Update check" section in `queue_manager.py`.
 
+## [1.6.0] - 2026-11-05
+
+### Changed
+- **Winner/loser ranking now follows Sonarr/Radarr's own upgrade
+  priority** instead of putting CF score first:
+  1. Quality position in the item's own quality profile (read from
+     `/api/v3/qualityprofile`). Qualities in the same group (e.g.
+     WEBDL-1080p and WEBRip-1080p under "WEB 1080p") count as equal, as
+     they do in Arr.
+  2. CF score, only when quality position is equal.
+  3. Revision (`version`, then `real`), so a PROPER/REPACK beats the
+     original.
+  4. Live qBit progress, only for true duplicates that tie on all of the
+     above. qBit is still only queried for the candidates tied at the top.
+
+  Example: a 2160p release at CF 200 now beats a 1080p release at CF 5000
+  (if your profile ranks 2160p higher). Before, the 1080p one won.
+- Profiles are fetched once per instance per run. Each queue item's
+  profile comes from its series/movie, which the queue request now embeds
+  (`includeSeries` / `includeMovie`), so there are no extra API calls per
+  item.
+- If profiles can't be read, or an item's quality isn't in its profile
+  (or it has no profile), quality counts as equal for that comparison and
+  CF score decides. This is logged. Nothing is guessed.
+- The log now says which factor decided each winner/loser (quality, CF,
+  revision, or progress) and shows each release's quality name. The
+  winner's progress is still shown in the log and Discord.
+
+### Removed
+- `settings.source_rank_order` and the hardcoded resolution/source
+  ranking. Your profile's order replaces them. A leftover
+  `source_rank_order` in an existing yml is ignored.
+
+## [1.5.0] - 2026-11-05
+
+### Fixed (ported from the standalone `arr_qui_watcher2.py` variant)
+- **Arr queue is now fetched in full, page by page.** Only the first 100
+  records were ever read before. A paused loser (or its winner) sitting
+  past that point looked like it "didn't exist" in Arr - so at resume
+  time the Arr `changeCategory` call was skipped and the category never
+  changed.
+- **Post-import category is now verified, not assumed.** After a loser
+  resumes, the script reads each download client's configured
+  Post-Import Category from Arr (Settings > Download Clients) and
+  confirms the torrent actually landed in it, setting it directly in qBit
+  if Arr's `changeCategory` didn't take. It keeps re-checking every run
+  while the torrent finishes, and won't stop tracking a finished torrent
+  until its category is correct. A no-op if you don't use a post-import
+  category.
+- Each tracked loser now remembers which download client it came from,
+  so the right post-import category is picked when an Arr instance has
+  more than one client. Older state entries without it still work when
+  only one client has a post-import category configured.
+
 ## [1.4.0] - 2026-11-05
 
 ### Fixed

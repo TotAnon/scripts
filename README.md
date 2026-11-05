@@ -8,7 +8,7 @@ I use Unraid
 | Script | What it does |
 |---|---|
 | [radarr_cf_report](radarr_cf_report) | Radarr custom format report (setup below) |
-| [queue_manager](queue_manager) | Queue manager for Radarr/Sonarr/qBittorrent via qui |
+| [queue_manager](queue_manager) | When Sonarr/Radarr end up downloading two releases of the same episode/movie, keeps the better one and purges or pauses the other (qBittorrent via qui), with Discord reports. Setup is in [its own README](queue_manager/README.md) |
 | [diskio_monitor](diskio_monitor) | Watches array disk I/O, works out what's keeping disks busy (containers, torrents), and reports to Discord. Setup is in [its own README](diskio_monitor/README.md) |
 
 # radarr_cf_report.py:

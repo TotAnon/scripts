@@ -7,7 +7,7 @@
 state_dir: /mnt/user/appdata/scripts/natorr/queue_manager
 
 # ── qui ──────────────────────────────────────────────────────────────────────
-# Plain URL to qui's web UI/API. If you're using wrapper_arr_qui_watcher.sh,
+# Plain URL to qui's web UI/API. If you're using queue_manager.sh,
 # this gets overwritten automatically before each run (resolved from your
 # "qui" container's current IP) - leave it as any placeholder. If running
 # this script directly instead, put a real reachable address here yourself.
@@ -73,16 +73,6 @@ settings:
   # How many *consecutive unreachable* attempts (retried every run) before
   # sending a Discord error alert. Resets whenever qBit responds again.
   resume_max_attempts_before_alert: 60
-
-  # Tie-break dimension used BETWEEN customFormatScore and live qBit
-  # progress when ranking duplicate/competing grabs: if two releases tie
-  # on score AND resolution, the one whose quality.quality.source matches
-  # higher up this list wins outright (no need to fall back to progress).
-  # Most-preferred first. A source Arr doesn't report, or that isn't in
-  # this list, is neutral - it never invents a ranking out of missing
-  # data, so this is safe to leave as-is even if your Arr version doesn't
-  # expose quality.quality.source at all.
-  source_rank_order: [bluray, web, webdl, webrip, hdtv, dvd, sdtv]
 
 # ── Discord ───────────────────────────────────────────────────────────────
 discord:
