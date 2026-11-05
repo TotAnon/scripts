@@ -5,7 +5,7 @@ A User Scripts add-on for Unraid that stops Sonarr and Radarr from wasting bandw
 That happens more than you'd think: Sonarr grabs a release, then a better one shows up a few minutes later (an upgrade), or autobrr pushes the exact same release from two trackers seconds apart and both get accepted. Arr leaves both downloading. queue_manager watches the queue, picks the one worth keeping, and deals with the other one:
 
 - **Barely started?** It's removed through Arr (with its files), so it doesn't sit there half-done.
-- **Already well along?** It's paused, tagged and pushed to the bottom of qBittorrent's queue, then resumed once nothing else is downloading, so you still finish it (and keep your ratio) without it competing for bandwidth.
+- **Already well along?** It's paused, tagged and pushed to the bottom of qBittorrent's queue, then resumed once nothing else is downloading, so you still finish it (and keep your ratio) without it competing for bandwidth. If something new starts downloading while it's finishing, it's paused again until that's done.
 
 Every decision is posted to Discord with the winner and loser side by side.
 
@@ -29,6 +29,7 @@ So a 2160p release at CF 200 beats a 1080p release at CF 5000 if your profile ra
 | Loser is below `purge_progress_threshold`, or below a tracker's `min_mb` in `tracker_overrides` | 🗑️ **Purged**: removed via Arr, files deleted (unless `enable_purge: false`) |
 | Loser is past that point | ⏸️ **Paused**: tagged `paused-by-supersede`, moved to the bottom of qBittorrent's queue, left in Arr's queue |
 | A paused loser, once nothing on any of your qBittorrent clients is actively downloading | ▶️ **Resumed**: cleared from Arr's queue, moved to its Post-Import Category (verified, and set directly if Arr didn't), and kept at the bottom of the queue until it finishes |
+| A resumed loser, when something else starts downloading before it's done | ⏸️ **Re-paused**: paused again, and resumed again once everything else is done. This can repeat as many times as needed |
 | Loser's tracker is in `excluded_trackers` | Left completely alone |
 
 The pause always happens *before* progress is measured, so the number the decision is based on can't keep climbing.
@@ -39,6 +40,7 @@ The pause always happens *before* progress is measured, so the number the decisi
 |---|---|
 | 🗑️ **Purged** / ⏸️ **Paused** | When a loser is handled. Winner and loser in separate boxes, grouped per show/season or movie, with CF score, tracker, and progress for both |
 | ▶️ **Resumed** | When a paused loser is resumed, including the category it moved to |
+| ⏸️ **Re-paused** | When a resumed loser is paused again because something else started downloading |
 | ⚠️ **Errors** | Failed removals, a paused torrent that vanished from qBittorrent, qBittorrent unreachable for a long stretch, a category that won't stick |
 | 🔔 **Update available** | Once per new version on GitHub, with the changelog and how to update |
 
@@ -118,6 +120,7 @@ If the changelog says `queue_manager.sh` itself changed, paste the new version i
 
 - **Log:** `arr_qui_watcher.log` in your `state_dir` (rotated at 10 MB, 5 backups). Every decision is logged with the qualities, CF scores, progress, and which factor decided it.
 - **State:** `paused_superseded.json` in `state_dir` holds the torrents currently being tracked. Delete it to make the script forget everything it's paused (they stay paused in qBittorrent until you resume them).
-- **A paused torrent never resumes:** it waits until nothing on any of your qBittorrent clients is actively downloading. If you always have something downloading (e.g. autobrr racing), it'll keep waiting.
+- **A paused torrent never resumes:** it waits until nothing on any of your qBittorrent clients is actively downloading (other losers the script is finishing don't count). If you always have something downloading (e.g. autobrr racing), it'll keep waiting.
+- **A loser keeps pausing and resuming:** that's expected when downloads come and go. It pauses whenever something else is downloading and picks up where it left off once things are quiet.
 - **"Quality position unknown" in the log:** a quality profile couldn't be read, or a release's quality isn't in its profile. CF score decided that one instead.
 - **Containers not found:** `resolve_and_patch.py` needs the containers to be running and named `radarr`, `sonarr` and `qui` (or edit the names in `queue_manager.sh`).

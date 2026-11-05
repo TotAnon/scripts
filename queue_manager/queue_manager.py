@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config defaults
@@ -191,7 +191,8 @@ DISCORD_EVENTS: List[Dict[str, Any]] = []
 
 
 def record_event(kind: str, **fields) -> None:
-    """kind: 'error' | 'purge' | 'pause' | 'resume'.
+    """kind: 'error' | 'purge' | 'pause' | 'repause' | 'resume'.
+    'repause' (like 'error' and 'resume') takes a single 'text' field.
     'error' and 'resume' take a single 'text' field (a fully formatted line).
     'purge' and 'pause' take: app_name, name, score, amount_display,
     winner_name, winner_score, winner_indexer, loser_indexer, and
@@ -303,17 +304,19 @@ def send_discord_batch(events: List[Dict[str, Any]]) -> None:
     if not DISCORD_WEBHOOK_URL or not events:
         return
 
-    order = ["error", "purge", "pause", "resume"]
+    order = ["error", "purge", "pause", "repause", "resume"]
     titles = {
         "error": "⚠️ Errors",
         "purge": "🗑️ Purged",
         "pause": "⏸️ Paused",
+        "repause": "⏸️ Re-paused",
         "resume": "▶️ Resumed",
     }
     colors = {
         "error": COLOR_ERROR,
         "purge": COLOR_PURGE,
         "pause": COLOR_PAUSE,
+        "repause": COLOR_PAUSE,
         "resume": COLOR_RESUME,
     }
 
@@ -635,9 +638,16 @@ class QBitProxyClient:
         return "resumed"
 
 
-def any_active_download(proxy_clients: List["QBitProxyClient"]) -> bool:
-    """The global resume gate: true if any torrent on any configured qBit
-    backend is actually transferring bytes right now (dlspeed > 0).
+def any_active_download(proxy_clients: List["QBitProxyClient"], ignore_hashes: Optional[set] = None) -> bool:
+    """The global resume/re-pause gate: true if any torrent on any
+    configured qBit backend is actually transferring bytes right now
+    (dlspeed > 0), not counting the torrents in ignore_hashes.
+
+    ignore_hashes is every loser this script is tracking. Without it, a
+    resumed loser that's downloading would count as "something else is
+    downloading" and re-pause itself on the next run, flipping back and
+    forth forever. It also means several resumed losers can finish side
+    by side instead of one holding the others back.
 
     Deliberately speed-based rather than state-string-based - a torrent
     sitting in a nominally 'downloading' lifecycle state (queuedDL,
@@ -653,8 +663,11 @@ def any_active_download(proxy_clients: List["QBitProxyClient"]) -> bool:
     briefly contending for bandwidth with a winner that's about to pick
     back up - self-limited to that one window, not worth guarding against
     at the cost of resurrecting the stuck-forever problem."""
+    ignore = {h.lower() for h in (ignore_hashes or set()) if h}
     for client in proxy_clients:
         for t in client.get_all_torrents():
+            if str(t.get("hash", "")).lower() in ignore:
+                continue
             try:
                 if float(t.get("dlspeed", 0)) > 0:
                     return True
@@ -1169,9 +1182,32 @@ def process_service(app_label: str, base_url: str, api_key: str, proxy_client: Q
             if progress >= 0.999:
                 log(f"[{app_label}] '{meta.get('name')}' finished downloading; no longer tracking.")
                 to_drop.append(thash)
-            else:
-                proxy_client.bottom_queue(raw_hash)
-                log(f"[{app_label}] '{meta.get('name')}' still completing ({progress*100:.1f}%); re-pinned to bottom of queue.")
+                continue
+
+            # Something else started downloading since this loser resumed:
+            # pause it again and send it back to "paused", where the normal
+            # gate resumes it once everything else is done. Same signal as
+            # the resume gate (see any_active_download), so a stuck import
+            # or a stalled torrent can't trigger this either.
+            if not safe_to_resume:
+                if proxy_client.pause_only(raw_hash):
+                    proxy_client.tag_and_deprioritize(raw_hash)
+                    meta["phase"] = "paused"
+                    meta["resume_attempts"] = 0
+                    meta["consecutive_unreachable"] = 0
+                    meta["repause_count"] = meta.get("repause_count", 0) + 1
+                    log(f"[{app_label}] '{meta.get('name')}' re-paused at {progress*100:.1f}% - something else "
+                        f"started downloading; it'll resume again once that's done.")
+                    record_event("repause", text=f"**{app_label}**: `{meta.get('name')}` paused again at "
+                                                 f"{progress*100:.1f}% - something else started downloading")
+                else:
+                    proxy_client.bottom_queue(raw_hash)
+                    log(f"[{app_label}] '{meta.get('name')}' should re-pause (something else is downloading) "
+                        f"but the pause didn't take; kept at the bottom of the queue, will retry next run.")
+                continue
+
+            proxy_client.bottom_queue(raw_hash)
+            log(f"[{app_label}] '{meta.get('name')}' still completing ({progress*100:.1f}%); re-pinned to bottom of queue.")
             continue
 
         if phase == "pending_check":
@@ -1571,7 +1607,8 @@ def main() -> None:
     # on live qBit state (dlspeed) rather than Arr's queue listing.
     instance_queues = {inst["label"]: get_arr_queue(inst["base_url"], inst["api_key"], inst["type"]) for inst in valid_instances}
     proxy_clients = {inst["label"]: QBitProxyClient(inst["qui_proxy"], qui_url) for inst in valid_instances}
-    safe_to_resume = not any_active_download(list(proxy_clients.values()))
+    managed_hashes = {meta.get("hash") for meta in tracked_state.values() if meta.get("hash")}
+    safe_to_resume = not any_active_download(list(proxy_clients.values()), managed_hashes)
 
     for inst in valid_instances:
         label = inst["label"]
